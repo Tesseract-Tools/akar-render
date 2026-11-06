@@ -249,7 +249,10 @@ static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node
     }
     ImageTextureNode *tex = graph->create_node<ImageTextureNode>();
     tex->set_filename(ustring(path_join(file.folder, textures[size_t(index)].first)));
-    tex->set_colorspace(colour ? u_colorspace_srgb : u_colorspace_data);
+    /* (Colour pictures are sRGB. Cycles' "__builtin_srgb" is only made linear through OpenColorIO,
+     * which the pack doesn't carry, so they'd be read as if linear: pale and greyed. Scene linear
+     * with the sRGB curve is kept as it is and made linear as it's looked up, with no OpenColorIO.) */
+    tex->set_colorspace(colour ? u_colorspace_scene_linear_srgb : u_colorspace_data);
     tex->set_interpolation(INTERPOLATION_LINEAR);
     tex->set_extension(EXTENSION_REPEAT);
     tex->set_alpha_type(IMAGE_ALPHA_AUTO);
