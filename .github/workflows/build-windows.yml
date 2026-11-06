@@ -158,7 +158,7 @@ jobs:
       - name: Keep the pack (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: akar-render-pack-${{ steps.cfg.outputs.version }}${{ steps.cfg.outputs.gpu == 'true' && '' || '-cpu' }}
+          name: akar-render-pack-${{ steps.cfg.outputs.version }}${{ steps.cfg.outputs.gpu == 'true' && '-nvidia' || '-cpu' }}
           path: |
             akar-render-pack-*.zip
             pack-latest.json
