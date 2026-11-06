@@ -223,12 +223,12 @@ struct Built {
   int width = 1280, height = 720;
 };
 
-static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node &m,
-                             const std::vector<std::pair<std::string, std::string>> &textures)
+/* One material's surface, added to a graph: its BSDF's output. <uv_map> names the texture
+ * coordinates its pictures use (null: the mesh's own, "UVMap"). */
+static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, const xml_node &m,
+                                 const std::vector<std::pair<std::string, std::string>> &textures,
+                                 const char *uv_map)
 {
-  Shader *shader = scene->create_node<Shader>();
-  shader->name = ustring(m.attribute("name").value());
-  unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
   PrincipledBsdfNode *bsdf = graph->create_node<PrincipledBsdfNode>();
   bsdf->set_base_color(f3(m, "color", make_float3(0.8f, 0.8f, 0.8f)));
   bsdf->set_roughness(f1(m, "roughness", 0.6f));
@@ -256,6 +256,11 @@ static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node
     tex->set_interpolation(INTERPOLATION_LINEAR);
     tex->set_extension(EXTENSION_REPEAT);
     tex->set_alpha_type(IMAGE_ALPHA_AUTO);
+    if (uv_map != nullptr) {
+      UVMapNode *uv = graph->create_node<UVMapNode>();
+      uv->set_attribute(ustring(uv_map));
+      graph->connect(uv->output("UV"), tex->input("Vector"));
+    }
     return tex;
   };
 
@@ -287,11 +292,41 @@ static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node
     NormalMapNode *nm = graph->create_node<NormalMapNode>();
     nm->set_space(NODE_NORMAL_MAP_TANGENT);
     nm->set_strength(f1(m, "normal_strength", 1.0f));
+    if (uv_map != nullptr) {
+      nm->set_attribute(ustring(uv_map));
+    }
     graph->connect(normal->output("Color"), nm->input("Color"));
     graph->connect(nm->output("Normal"), bsdf->input("Normal"));
   }
 
-  graph->connect(bsdf->output("BSDF"), graph->output()->input("Surface"));
+  return bsdf->output("BSDF");
+}
+
+/* A material, or a pair: front="i" back="j" names two earlier materials, the front's seen from
+ * the front of a face and the back's from behind it (the back's pictures on the mesh's "UVBack"). */
+static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node &m,
+                             const std::vector<std::pair<std::string, std::string>> &textures,
+                             const std::vector<xml_node> &nodes)
+{
+  Shader *shader = scene->create_node<Shader>();
+  shader->name = ustring(m.attribute("name").value());
+  unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
+  const int front = i1(m, "front", -1), back = i1(m, "back", -1);
+  ShaderOutput *surface = nullptr;
+  if (front >= 0 && back >= 0 && front < int(nodes.size()) && back < int(nodes.size())) {
+    ShaderOutput *a = add_surface(graph.get(), file, nodes[size_t(front)], textures, nullptr);
+    ShaderOutput *b = add_surface(graph.get(), file, nodes[size_t(back)], textures, "UVBack");
+    GeometryNode *geometry = graph->create_node<GeometryNode>();
+    MixClosureNode *mix = graph->create_node<MixClosureNode>();
+    graph->connect(geometry->output("Backfacing"), mix->input("Fac"));
+    graph->connect(a, mix->input("Closure1"));
+    graph->connect(b, mix->input("Closure2"));
+    surface = mix->output("Closure");
+  }
+  else {
+    surface = add_surface(graph.get(), file, m, textures, nullptr);
+  }
+  graph->connect(surface, graph->output()->input("Surface"));
   shader->set_graph(std::move(graph));
   shader->tag_update(scene);
   return shader;
@@ -308,6 +343,11 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
   at += nv * 3 * sizeof(float);
   const float *UV = blob_at<float>(file, at, nv * 2);
   at += nv * 2 * sizeof(float);
+  const float *UV2 = nullptr; /* (the backs' texture coordinates, when some faces show both sides) */
+  if (i1(n, "uv2", 0)) {
+    UV2 = blob_at<float>(file, at, nv * 2);
+    at += nv * 2 * sizeof(float);
+  }
   const int32_t *tri = blob_at<int32_t>(file, at, nt * 3);
   at += nt * 3 * sizeof(int32_t);
   const uint16_t *slot = blob_at<uint16_t>(file, at, nt);
@@ -358,6 +398,14 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
   for (size_t t = 0; t < nt * 3; t++) {
     const size_t v = size_t(triangles[t]);
     ud[t] = make_float2(UV[v * 2], UV[v * 2 + 1]);
+  }
+  if (UV2 != nullptr) {
+    Attribute *back = mesh->attributes.add(ustring("UVBack"), TypeFloat2, ATTR_ELEMENT_CORNER);
+    float2 *bd = back->data_for_write<float2>();
+    for (size_t t = 0; t < nt * 3; t++) {
+      const size_t v = size_t(triangles[t]);
+      bd[t] = make_float2(UV2[v * 2], UV2[v * 2 + 1]);
+    }
   }
   return mesh;
 }
@@ -572,8 +620,12 @@ static Built build_scene(Scene *scene, const SceneFile &file)
   for (xml_node t = root.child("texture"); t; t = t.next_sibling("texture")) {
     textures.emplace_back(t.attribute("path").value(), t.attribute("colorspace").value());
   }
+  std::vector<xml_node> material_nodes;
   for (xml_node m = root.child("material"); m; m = m.next_sibling("material")) {
-    built.materials.push_back(make_material(scene, file, m, textures));
+    material_nodes.push_back(m);
+  }
+  for (const xml_node &m : material_nodes) {
+    built.materials.push_back(make_material(scene, file, m, textures, material_nodes));
   }
   for (xml_node n = root.child("mesh"); n; n = n.next_sibling("mesh")) {
     built.meshes.push_back(make_mesh(scene, file, n, built));
