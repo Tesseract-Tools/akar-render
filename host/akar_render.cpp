@@ -472,6 +472,24 @@ static void make_world(Scene *scene, const std::string &folder, const xml_node &
   bg->set_graph(std::move(graph));
   bg->tag_update(scene);
 
+  /* The sky as a light as well. Cycles looks for the background directly (and by how bright each
+   * part of it is) only through a background light; without one, a room lit through its windows
+   * is found by the sky only when a bounce happens to go out of a window: grainy, and the
+   * denoiser turns the grain into smudges and scratches. (A plain colour needs none: Cycles
+   * leaves it off.) */
+  {
+    BackgroundLight *sky = scene->create_node<BackgroundLight>();
+    sky->set_map_resolution(i1(world, "map_resolution", 0)); /* (0: as Cycles sees fit) */
+    sky->set_use_mis(true);
+    array<Node *> used;
+    used.push_back_slow(bg);
+    sky->set_used_shaders(used);
+    Object *object = scene->create_node<Object>();
+    object->set_tfm(transform_identity());
+    object->set_visibility(PATH_RAY_VISIBILITY_ALL & ~PATH_RAY_VISIBILITY_CAMERA);
+    object->set_geometry(sky);
+  }
+
   if (sun) {
     SunLight *light = scene->create_node<SunLight>();
     light->set_strength(f3(sun, "color", one_float3()) * f1(sun, "strength", 4.0f));
