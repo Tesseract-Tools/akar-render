@@ -1,0 +1,753 @@
+/* SPDX-FileCopyrightText: 2026 Tesseract Studio
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * akar-render: the photoreal renderer for Akar (by Tesseract Studio), built on Cycles.
+ *
+ * Akar writes the model to render as one scene file (see docs/scene-format.md) and starts this
+ * program in its own process, so a crash here never takes Akar down. It renders the scene with
+ * Cycles on the best device there is (OptiX on NVIDIA RTX cards, then CUDA, then the
+ * processor), writes the picture as it improves and when it's done, and reports progress on
+ * standard output, one line at a time:
+ *
+ *   DEVICE <type> <name>
+ *   PROGRESS <0..1> <samples done> <samples asked> <seconds so far> <seconds left, -1 unknown>
+ *   PREVIEW <path>          (a newer picture is there)
+ *   DONE <path> <seconds>
+ *   ERROR <message>
+ *
+ * A line "stop" on standard input ends the render early, keeping what's done.
+ * The pictures are 32-bit float RGBA, linear (scene-referred), top row first, as a small header
+ * ("AKRI", width, height, samples) and the pixels; Akar applies exposure and the tone curve.
+ */
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "device/device.h"
+#include "scene/background.h"
+#include "scene/camera.h"
+#include "scene/film.h"
+#include "scene/integrator.h"
+#include "scene/light.h"
+#include "scene/mesh.h"
+#include "scene/object.h"
+#include "scene/pass.h"
+#include "scene/scene.h"
+#include "scene/shader.h"
+#include "scene/shader_graph.h"
+#include "scene/shader_nodes.h"
+#include "session/buffers.h"
+#include "session/output_driver.h"
+#include "session/session.h"
+#include "util/colorspace.h"
+#include "util/log.h"
+#include "util/path.h"
+#include "util/progress.h"
+#include "util/string.h"
+#include "util/system.h"
+#include "util/transform.h"
+#include "util/unique_ptr.h"
+#include "util/version.h"
+#include "util/xml.h"
+
+CCL_NAMESPACE_BEGIN
+
+static std::mutex print_mutex;
+
+static void say(const std::string &line)
+{
+  std::lock_guard<std::mutex> lock(print_mutex);
+  std::fputs(line.c_str(), stdout);
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
+}
+
+[[noreturn]] static void fail(const std::string &message)
+{
+  say("ERROR " + message);
+  std::exit(1);
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Reading the scene file                                                                    */
+/* ---------------------------------------------------------------------------------------- */
+
+static std::vector<float> floats(const char *text)
+{
+  std::vector<float> out;
+  const char *p = text ? text : "";
+  while (*p) {
+    char *end = nullptr;
+    const float v = std::strtof(p, &end);
+    if (end == p) {
+      ++p;
+      continue;
+    }
+    out.push_back(v);
+    p = end;
+  }
+  return out;
+}
+
+static float3 f3(const xml_node &n, const char *name, const float3 fallback)
+{
+  const std::vector<float> v = floats(n.attribute(name).value());
+  return v.size() >= 3 ? make_float3(v[0], v[1], v[2]) : fallback;
+}
+
+static float f1(const xml_node &n, const char *name, const float fallback)
+{
+  const xml_attribute a = n.attribute(name);
+  return a ? a.as_float(fallback) : fallback;
+}
+
+static int i1(const xml_node &n, const char *name, const int fallback)
+{
+  const xml_attribute a = n.attribute(name);
+  return a ? a.as_int(fallback) : fallback;
+}
+
+/* A transform from its 12 numbers, three rows of four (rotation and scale, then the move). */
+static Transform tfm12(const xml_node &n, const char *name)
+{
+  const std::vector<float> m = floats(n.attribute(name).value());
+  if (m.size() < 12) {
+    return transform_identity();
+  }
+  Transform t;
+  t.x = make_float4(m[0], m[1], m[2], m[3]);
+  t.y = make_float4(m[4], m[5], m[6], m[7]);
+  t.z = make_float4(m[8], m[9], m[10], m[11]);
+  return t;
+}
+
+/* A frame whose -Z points along `dir` (where lights shine), placed at `pos`. */
+static Transform facing(const float3 pos, float3 dir)
+{
+  dir = safe_normalize(dir);
+  if (len_squared(dir) < 1e-12f) {
+    dir = make_float3(0.0f, 0.0f, -1.0f);
+  }
+  const float3 z = -dir;
+  const float3 helper = fabsf(z.z) < 0.9f ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
+  const float3 x = safe_normalize(cross(helper, z));
+  const float3 y = cross(z, x);
+  Transform t;
+  t.x = make_float4(x.x, y.x, z.x, pos.x);
+  t.y = make_float4(x.y, y.y, z.y, pos.y);
+  t.z = make_float4(x.z, y.z, z.z, pos.z);
+  return t;
+}
+
+struct SceneFile {
+  xml_document doc;
+  std::vector<char> blob;
+  std::string folder;
+};
+
+static void read_scene_file(const std::string &path, SceneFile &file)
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    fail("can't open the scene file " + path);
+  }
+  char magic[4];
+  uint32_t version = 0, xml_length = 0;
+  in.read(magic, 4);
+  in.read(reinterpret_cast<char *>(&version), 4);
+  in.read(reinterpret_cast<char *>(&xml_length), 4);
+  if (!in || std::memcmp(magic, "AKRS", 4) != 0 || version != 1) {
+    fail("not an Akar render scene (or a newer one): " + path);
+  }
+  std::string xml(xml_length, '\0');
+  in.read(xml.data(), xml_length);
+  const std::streamoff here = in.tellg();
+  const std::streamoff blob_start = (here + 15) & ~std::streamoff(15);
+  in.seekg(0, std::ios::end);
+  const std::streamoff end = in.tellg();
+  if (end < blob_start) {
+    fail("the scene file is cut short");
+  }
+  file.blob.resize(size_t(end - blob_start));
+  in.seekg(blob_start);
+  in.read(file.blob.data(), std::streamsize(file.blob.size()));
+  const xml_parse_result ok = file.doc.load_string(xml.c_str());
+  if (!ok) {
+    fail(std::string("the scene's description can't be read: ") + ok.description());
+  }
+  file.folder = path_dirname(path);
+}
+
+template<typename T> static const T *blob_at(const SceneFile &file, const size_t offset, const size_t count)
+{
+  if (offset + count * sizeof(T) > file.blob.size()) {
+    fail("the scene file's data is cut short");
+  }
+  return reinterpret_cast<const T *>(file.blob.data() + offset);
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Building the Cycles scene                                                                 */
+/* ---------------------------------------------------------------------------------------- */
+
+struct Built {
+  std::vector<Shader *> materials;
+  std::vector<Mesh *> meshes;
+  int width = 1280, height = 720;
+};
+
+static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node &m,
+                             const std::vector<std::pair<std::string, std::string>> &textures)
+{
+  Shader *shader = scene->create_node<Shader>();
+  shader->name = ustring(m.attribute("name").value());
+  unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
+  PrincipledBsdfNode *bsdf = graph->create_node<PrincipledBsdfNode>();
+  bsdf->set_base_color(f3(m, "color", make_float3(0.8f, 0.8f, 0.8f)));
+  bsdf->set_roughness(f1(m, "roughness", 0.6f));
+  bsdf->set_metallic(f1(m, "metallic", 0.0f));
+  bsdf->set_ior(f1(m, "ior", 1.5f));
+  bsdf->set_specular_ior_level(f1(m, "specular", 0.5f));
+  bsdf->set_transmission_weight(f1(m, "transmission", 0.0f));
+  bsdf->set_alpha(f1(m, "alpha", 1.0f));
+  const float emission = f1(m, "emission_strength", 0.0f);
+  if (emission > 0.0f) {
+    bsdf->set_emission_color(f3(m, "emission", make_float3(1.0f, 1.0f, 1.0f)));
+    bsdf->set_emission_strength(emission);
+  }
+
+  auto texture_node = [&](const int index, const bool colour) -> ImageTextureNode * {
+    if (index < 0 || index >= int(textures.size())) {
+      return nullptr;
+    }
+    ImageTextureNode *tex = graph->create_node<ImageTextureNode>();
+    tex->set_filename(ustring(path_join(file.folder, textures[size_t(index)].first)));
+    tex->set_colorspace(colour ? u_colorspace_srgb : u_colorspace_data);
+    tex->set_interpolation(INTERPOLATION_LINEAR);
+    tex->set_extension(EXTENSION_REPEAT);
+    tex->set_alpha_type(IMAGE_ALPHA_AUTO);
+    return tex;
+  };
+
+  if (ImageTextureNode *tex = texture_node(i1(m, "texture", -1), true)) {
+    if (i1(m, "tint", 0)) {
+      /* A colour multiplied over the picture (Akar's tinted textures). */
+      VectorMathNode *mul = graph->create_node<VectorMathNode>();
+      mul->set_math_type(NODE_VECTOR_MATH_MULTIPLY);
+      mul->set_vector2(f3(m, "tint_color", one_float3()));
+      graph->connect(tex->output("Color"), mul->input("Vector1"));
+      graph->connect(mul->output("Vector"), bsdf->input("Base Color"));
+    }
+    else {
+      graph->connect(tex->output("Color"), bsdf->input("Base Color"));
+    }
+    if (i1(m, "cutout", 0)) {
+      graph->connect(tex->output("Alpha"), bsdf->input("Alpha"));
+    }
+  }
+  if (ImageTextureNode *rough = texture_node(i1(m, "roughness_map", -1), false)) {
+    SeparateColorNode *split = graph->create_node<SeparateColorNode>();
+    graph->connect(rough->output("Color"), split->input("Color"));
+    graph->connect(split->output("Green"), bsdf->input("Roughness")); /* (glTF: G roughness, B metal) */
+    if (i1(m, "metallic_from_map", 0)) {
+      graph->connect(split->output("Blue"), bsdf->input("Metallic"));
+    }
+  }
+  if (ImageTextureNode *normal = texture_node(i1(m, "normal_map", -1), false)) {
+    NormalMapNode *nm = graph->create_node<NormalMapNode>();
+    nm->set_space(NODE_NORMAL_MAP_TANGENT);
+    nm->set_strength(f1(m, "normal_strength", 1.0f));
+    graph->connect(normal->output("Color"), nm->input("Color"));
+    graph->connect(nm->output("Normal"), bsdf->input("Normal"));
+  }
+
+  graph->connect(bsdf->output("BSDF"), graph->output()->input("Surface"));
+  shader->set_graph(std::move(graph));
+  shader->tag_update(scene);
+  return shader;
+}
+
+static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, const Built &built)
+{
+  const size_t nv = size_t(i1(n, "vertices", 0));
+  const size_t nt = size_t(i1(n, "triangles", 0));
+  size_t at = size_t(std::stoull(n.attribute("offset").value()));
+  const float *P = blob_at<float>(file, at, nv * 3);
+  at += nv * 3 * sizeof(float);
+  const float *N = blob_at<float>(file, at, nv * 3);
+  at += nv * 3 * sizeof(float);
+  const float *UV = blob_at<float>(file, at, nv * 2);
+  at += nv * 2 * sizeof(float);
+  const int32_t *tri = blob_at<int32_t>(file, at, nt * 3);
+  at += nt * 3 * sizeof(int32_t);
+  const uint16_t *slot = blob_at<uint16_t>(file, at, nt);
+
+  Mesh *mesh = scene->create_node<Mesh>();
+  mesh->name = ustring(n.attribute("name").value());
+
+  /* Its materials: indices into the scene's, in the order its triangles name them. */
+  array<Node *> used;
+  const std::vector<float> mats = floats(n.attribute("materials").value());
+  for (const float f : mats) {
+    const int i = int(f);
+    used.push_back_slow(i >= 0 && i < int(built.materials.size()) ? built.materials[size_t(i)] : scene->default_surface);
+  }
+  if (used.empty()) {
+    used.push_back_slow(scene->default_surface);
+  }
+  mesh->set_used_shaders(used);
+
+  mesh->resize_mesh(int(nv), int(nt));
+  packed_float3 *pos = mesh->get_position_for_write();
+  for (size_t v = 0; v < nv; v++) {
+    pos[v] = make_float3(P[v * 3], P[v * 3 + 1], P[v * 3 + 2]);
+  }
+  int *triangles = mesh->get_triangles().data();
+  for (size_t t = 0; t < nt * 3; t++) {
+    const int32_t i = tri[t];
+    triangles[t] = (i >= 0 && size_t(i) < nv) ? i : 0;
+  }
+  array<int> &shaders = mesh->get_shader();
+  for (size_t t = 0; t < nt; t++) {
+    shaders[t] = slot[t] < used.size() ? int(slot[t]) : 0;
+  }
+  std::ranges::fill(mesh->get_smooth(), true);
+  mesh->tag_triangles_modified();
+  mesh->tag_shader_modified();
+  mesh->tag_smooth_modified();
+
+  Attribute *normals = mesh->attributes.add(ATTR_STD_VERTEX_NORMAL);
+  packed_normal *nd = normals->data_for_write<packed_normal>();
+  for (size_t v = 0; v < nv; v++) {
+    nd[v] = packed_normal(make_float3(N[v * 3], N[v * 3 + 1], N[v * 3 + 2]));
+  }
+
+  /* Texture coordinates, at each corner of each triangle. */
+  Attribute *uv = mesh->attributes.add(ATTR_STD_UV, ustring("UVMap"));
+  float2 *ud = uv->data_for_write<float2>();
+  for (size_t t = 0; t < nt * 3; t++) {
+    const size_t v = size_t(triangles[t]);
+    ud[t] = make_float2(UV[v * 2], UV[v * 2 + 1]);
+  }
+  return mesh;
+}
+
+static void make_light(Scene *scene, const xml_node &n)
+{
+  const std::string type = n.attribute("type").value();
+  const float3 colour = f3(n, "color", one_float3());
+  const float power = f1(n, "power", 10.0f); /* watts, as Blender's */
+  const float3 pos = f3(n, "position", zero_float3());
+  const float3 dir = f3(n, "dir", make_float3(0.0f, 0.0f, -1.0f));
+  Light *light = nullptr;
+  if (type == "spot") {
+    SpotLight *spot = scene->create_node<SpotLight>();
+    spot->set_radius(f1(n, "radius", 0.02f));
+    spot->set_angle(f1(n, "spot_angle", 0.8f));
+    spot->set_smooth(f1(n, "spot_smooth", 0.3f));
+    light = spot;
+  }
+  else if (type == "area") {
+    AreaLight *area = scene->create_node<AreaLight>();
+    area->set_sizeu(f1(n, "size_u", 0.3f));
+    area->set_sizev(f1(n, "size_v", 0.3f));
+    area->set_ellipse(i1(n, "ellipse", 0) != 0);
+    area->set_spread(f1(n, "spread", float(M_PI)));
+    light = area;
+  }
+  else {
+    PointLight *point = scene->create_node<PointLight>();
+    point->set_radius(f1(n, "radius", 0.02f));
+    light = point;
+  }
+  light->set_strength(colour * power);
+  light->set_cast_shadow(true);
+  light->set_use_mis(true);
+  array<Node *> used;
+  used.push_back_slow(scene->default_light);
+  light->set_used_shaders(used);
+  Object *object = scene->create_node<Object>();
+  object->set_tfm(facing(pos, dir));
+  object->set_visibility(PATH_RAY_VISIBILITY_ALL & ~PATH_RAY_VISIBILITY_CAMERA);
+  object->set_geometry(light);
+}
+
+static void make_world(Scene *scene, const xml_node &world, const xml_node &sun)
+{
+  Shader *bg = scene->default_background;
+  unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
+  BackgroundNode *back = graph->create_node<BackgroundNode>();
+  back->set_strength(f1(world, "strength", 1.0f));
+  const std::string kind = world.attribute("kind").value();
+  if (kind == "sky") {
+    SkyTextureNode *sky = graph->create_node<SkyTextureNode>();
+    sky->set_sky_type(NODE_SKY_HOSEK);
+    sky->set_sun_direction(safe_normalize(f3(world, "sun_dir", make_float3(0.3f, -0.5f, 0.8f))));
+    sky->set_turbidity(f1(world, "turbidity", 2.5f));
+    sky->set_ground_albedo(f1(world, "ground_albedo", 0.3f));
+    graph->connect(sky->output("Color"), back->input("Color"));
+  }
+  else {
+    back->set_color(f3(world, "color", make_float3(0.8f, 0.85f, 0.9f)));
+  }
+  graph->connect(back->output("Background"), graph->output()->input("Surface"));
+  bg->set_graph(std::move(graph));
+  bg->tag_update(scene);
+
+  if (sun) {
+    SunLight *light = scene->create_node<SunLight>();
+    light->set_strength(f3(sun, "color", one_float3()) * f1(sun, "strength", 4.0f));
+    light->set_angle(f1(sun, "angle", 0.0105f));
+    light->set_cast_shadow(true);
+    light->set_use_mis(true);
+    array<Node *> used;
+    used.push_back_slow(scene->default_light);
+    light->set_used_shaders(used);
+    Object *object = scene->create_node<Object>();
+    /* "dir" points to the sun; the light travels the other way. */
+    object->set_tfm(facing(zero_float3(), -f3(sun, "dir", make_float3(0.3f, -0.5f, 0.8f))));
+    object->set_visibility(PATH_RAY_VISIBILITY_ALL & ~PATH_RAY_VISIBILITY_CAMERA);
+    object->set_geometry(light);
+  }
+}
+
+static void make_camera(Scene *scene, const xml_node &c, const int width, const int height)
+{
+  Camera *cam = scene->camera;
+  cam->set_full_width(width);
+  cam->set_full_height(height);
+  const float3 eye = f3(c, "eye", zero_float3());
+  const float3 right = safe_normalize(f3(c, "right", make_float3(1, 0, 0)));
+  const float3 up = safe_normalize(f3(c, "up", make_float3(0, 0, 1)));
+  const float3 fwd = safe_normalize(f3(c, "forward", make_float3(0, 1, 0)));
+  /* Cycles' camera looks along its +Z, with +X right and +Y up. */
+  Transform t;
+  t.x = make_float4(right.x, up.x, fwd.x, eye.x);
+  t.y = make_float4(right.y, up.y, fwd.y, eye.y);
+  t.z = make_float4(right.z, up.z, fwd.z, eye.z);
+  cam->set_matrix(t);
+  cam->set_nearclip(f1(c, "clip_start", 0.01f));
+  cam->set_farclip(f1(c, "clip_end", 10000.0f));
+  const float aspect = float(width) / float(height);
+  if (i1(c, "ortho", 0)) {
+    cam->set_camera_type(CAMERA_ORTHOGRAPHIC);
+    const float h = f1(c, "ortho_half_height", 5.0f);
+    cam->set_viewplane_left(-h * aspect);
+    cam->set_viewplane_right(h * aspect);
+    cam->set_viewplane_bottom(-h);
+    cam->set_viewplane_top(h);
+  }
+  else {
+    cam->set_camera_type(CAMERA_PERSPECTIVE);
+    /* Akar's field of view is the picture's height; Cycles' is its shorter side. */
+    const float fov_y = f1(c, "fov_y", 0.61f);
+    const float shift = f1(c, "shift_y", 0.0f);
+    float vx = aspect, vy = 1.0f, fov = fov_y;
+    if (aspect < 1.0f) {
+      /* Portrait: Cycles' fov is across the width. */
+      fov = 2.0f * atanf(tanf(fov_y * 0.5f) * aspect);
+      vx = 1.0f;
+      vy = 1.0f / aspect;
+    }
+    cam->set_fov(fov);
+    cam->set_viewplane_left(-vx);
+    cam->set_viewplane_right(vx);
+    cam->set_viewplane_bottom(-vy - shift * vy);
+    cam->set_viewplane_top(vy - shift * vy);
+  }
+  cam->need_flags_update = true;
+  cam->update(scene);
+}
+
+static Built build_scene(Scene *scene, const SceneFile &file)
+{
+  Built built;
+  const xml_node root = file.doc.child("akar-render");
+  if (!root) {
+    fail("the scene description has no <akar-render>");
+  }
+  const xml_node film = root.child("film");
+  built.width = std::max(16, i1(film, "width", 1280));
+  built.height = std::max(16, i1(film, "height", 720));
+  scene->film->set_exposure(1.0f);
+  scene->film->set_filter_width(f1(film, "filter_width", 1.5f));
+
+  std::vector<std::pair<std::string, std::string>> textures;
+  for (xml_node t = root.child("texture"); t; t = t.next_sibling("texture")) {
+    textures.emplace_back(t.attribute("path").value(), t.attribute("colorspace").value());
+  }
+  for (xml_node m = root.child("material"); m; m = m.next_sibling("material")) {
+    built.materials.push_back(make_material(scene, file, m, textures));
+  }
+  for (xml_node n = root.child("mesh"); n; n = n.next_sibling("mesh")) {
+    built.meshes.push_back(make_mesh(scene, file, n, built));
+  }
+  size_t objects = 0;
+  for (xml_node o = root.child("object"); o; o = o.next_sibling("object")) {
+    const int m = i1(o, "mesh", -1);
+    if (m < 0 || m >= int(built.meshes.size())) {
+      continue;
+    }
+    Object *object = scene->create_node<Object>();
+    object->set_geometry(built.meshes[size_t(m)]);
+    object->set_tfm(tfm12(o, "tfm"));
+    objects++;
+  }
+  size_t lights = 0;
+  for (xml_node l = root.child("light"); l; l = l.next_sibling("light")) {
+    make_light(scene, l);
+    lights++;
+  }
+  make_world(scene, root.child("world"), root.child("sun"));
+  make_camera(scene, root.child("camera"), built.width, built.height);
+  say(string_printf("SCENE %zu materials %zu meshes %zu objects %zu lights",
+                    built.materials.size(), built.meshes.size(), objects, lights));
+  return built;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Writing the picture                                                                       */
+/* ---------------------------------------------------------------------------------------- */
+
+class PictureDriver : public OutputDriver {
+ public:
+  PictureDriver(std::string folder, std::atomic<int> *samples) : folder_(std::move(folder)), samples_(samples) {}
+
+  void write_render_tile(const Tile &tile) override
+  {
+    if (write(tile, "final.akri")) {
+      final_written = true;
+    }
+  }
+
+  bool update_render_tile(const Tile &tile) override
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_ < std::chrono::milliseconds(900)) {
+      return false;
+    }
+    last_ = now;
+    if (write(tile, "preview.akri")) {
+      say("PREVIEW " + path_join(folder_, "preview.akri"));
+      return true;
+    }
+    return false;
+  }
+
+  bool final_written = false;
+
+ private:
+  bool write(const Tile &tile, const char *name)
+  {
+    if (!(tile.size == tile.full_size)) {
+      return false; /* (whole pictures only) */
+    }
+    const int w = tile.size.x, h = tile.size.y;
+    std::vector<float> px(size_t(w) * size_t(h) * 4);
+    if (!tile.get_pass_pixels("combined", 4, px.data())) {
+      return false;
+    }
+    const std::string path = path_join(folder_, name);
+    const std::string temp = path + ".part";
+    {
+      std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        return false;
+      }
+      const int32_t header[4] = {int32_t(w), int32_t(h), int32_t(samples_ ? samples_->load() : 0), 0};
+      out.write("AKRI", 4);
+      out.write(reinterpret_cast<const char *>(header), sizeof(header));
+      /* Cycles' rows run from the bottom; the file's from the top. */
+      for (int y = h - 1; y >= 0; y--) {
+        out.write(reinterpret_cast<const char *>(px.data() + size_t(y) * size_t(w) * 4), std::streamsize(size_t(w) * 4 * sizeof(float)));
+      }
+      if (!out) {
+        return false;
+      }
+    }
+    std::remove(path.c_str());
+    return std::rename(temp.c_str(), path.c_str()) == 0;
+  }
+
+  std::string folder_;
+  std::atomic<int> *samples_;
+  std::chrono::steady_clock::time_point last_{};
+};
+
+/* ---------------------------------------------------------------------------------------- */
+
+static DeviceInfo choose_device(const std::string &wanted)
+{
+  const char *order[] = {"OPTIX", "CUDA", "CPU"};
+  for (const char *name : order) {
+    if (wanted != "AUTO" && wanted != name) {
+      continue;
+    }
+    const DeviceType type = Device::type_from_string(name);
+    const vector<DeviceInfo> devices = Device::available_devices(DEVICE_MASK(type));
+    if (!devices.empty()) {
+      return devices.front();
+    }
+  }
+  const vector<DeviceInfo> cpu = Device::available_devices(DEVICE_MASK_CPU);
+  if (cpu.empty()) {
+    fail("no device to render on");
+  }
+  return cpu.front();
+}
+
+CCL_NAMESPACE_END
+
+using namespace ccl;
+
+int main(const int argc, const char **argv)
+{
+  log_init(nullptr);
+  path_init();
+  system_max_open_files_ensure();
+
+  std::string scene_path, out_folder, device_name = "AUTO";
+  int samples = 512, threads = 0;
+  float threshold = 0.01f;
+  double time_limit = 0.0;
+  bool denoise = true, list = false;
+  for (int i = 1; i < argc; i++) {
+    const std::string a = argv[i];
+    auto next = [&]() -> std::string { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+    if (a == "--device") {
+      device_name = next();
+      for (char &ch : device_name) {
+        ch = char(std::toupper(static_cast<unsigned char>(ch)));
+      }
+    }
+    else if (a == "--samples") samples = std::max(1, std::atoi(next().c_str()));
+    else if (a == "--threshold") threshold = float(std::atof(next().c_str()));
+    else if (a == "--time-limit") time_limit = std::atof(next().c_str());
+    else if (a == "--threads") threads = std::atoi(next().c_str());
+    else if (a == "--no-denoise") denoise = false;
+    else if (a == "--out") out_folder = next();
+    else if (a == "--list-devices") list = true;
+    else if (a == "--version") { say(std::string("akar-render 1 (Cycles ") + CYCLES_VERSION_STRING + ")"); return 0; }
+    else scene_path = a;
+  }
+  if (list) {
+    for (const DeviceInfo &info : Device::available_devices()) {
+      say("DEVICE " + Device::string_from_type(info.type) + " " + info.description);
+    }
+    return 0;
+  }
+  if (scene_path.empty()) {
+    say("usage: akar-render <scene.akrs> [--out folder] [--device auto|optix|cuda|cpu] [--samples n] [--threshold t] [--time-limit s] [--no-denoise]");
+    return 2;
+  }
+  if (out_folder.empty()) {
+    out_folder = path_dirname(scene_path);
+  }
+
+  SceneFile file;
+  read_scene_file(scene_path, file);
+
+  SessionParams sp;
+  sp.device = choose_device(device_name);
+  sp.background = true;
+  sp.samples = samples;
+  sp.threads = threads;
+  sp.time_limit = time_limit;
+  sp.use_auto_tile = false;
+  sp.tile_size = 0;
+  SceneParams scp;
+  scp.shadingsystem = SHADINGSYSTEM_SVM;
+  say("DEVICE " + Device::string_from_type(sp.device.type) + " " + sp.device.description);
+
+  unique_ptr<Session> session = make_unique<Session>(sp, scp);
+  std::atomic<int> done_samples{0};
+  auto driver = make_unique<PictureDriver>(out_folder, &done_samples);
+  PictureDriver *picture = driver.get();
+  session->set_output_driver(std::move(driver));
+
+  Scene *scene = session->scene.get();
+  Built built;
+  {
+    const thread_scoped_lock lock(scene->mutex);
+    built = build_scene(scene, file);
+    Integrator *in = scene->integrator;
+    in->set_use_adaptive_sampling(true);
+    in->set_adaptive_threshold(threshold);
+    in->set_max_bounce(12);
+    in->set_max_diffuse_bounce(4);
+    in->set_max_glossy_bounce(4);
+    in->set_max_transmission_bounce(8);
+    in->set_transparent_max_bounce(16);
+    in->set_sample_clamp_indirect(10.0f);
+    in->set_use_light_tree(true);
+    in->set_use_denoise(denoise);
+    in->set_denoiser_type(DENOISER_OPENIMAGEDENOISE);
+    in->set_denoiser_prefilter(DENOISER_PREFILTER_ACCURATE);
+    Pass *pass = scene->create_node<Pass>();
+    pass->set_name(ustring("combined"));
+    pass->set_type(PASS_COMBINED);
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  auto seconds = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
+  session->progress.set_update_callback([&]() {
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(250)) {
+      return;
+    }
+    last = now;
+    const int s = session->progress.get_current_sample();
+    done_samples = s;
+    double total = 0.0, render = 0.0;
+    session->progress.get_time(total, render);
+    const double p = session->progress.get_progress();
+    const double left = p > 0.02 ? total * (1.0 - p) / p : -1.0;
+    say(string_printf("PROGRESS %.4f %d %d %.1f %.1f", p, s, samples, seconds(), left));
+  });
+
+  /* "stop" on standard input ends the render, keeping what's done. */
+  std::thread listener([&]() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+      if (line.rfind("stop", 0) == 0) {
+        session->set_time_limit(0.001);
+        session->set_samples(std::max(1, session->progress.get_current_sample()));
+        break;
+      }
+    }
+  });
+  listener.detach();
+
+  BufferParams bp;
+  bp.width = built.width;
+  bp.height = built.height;
+  bp.full_width = built.width;
+  bp.full_height = built.height;
+  session->reset(sp, bp);
+  session->start();
+  session->wait();
+
+  const std::string error = session->progress.get_error_message();
+  const bool written = picture->final_written;
+  session.reset();
+  if (!error.empty()) {
+    fail(error);
+  }
+  if (!written) {
+    fail("the render ended without a picture");
+  }
+  say(string_printf("DONE %s %.1f", path_join(out_folder, "final.akri").c_str(), seconds()));
+  return 0;
+}

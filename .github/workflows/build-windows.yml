@@ -1,0 +1,175 @@
+# Builds akar-render (Akar's photoreal renderer) on Cycles for Windows x64, with NVIDIA
+# OptiX and CUDA kernels and the processor, and packs it as Akar's render pack.
+name: Build render pack (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Build the NVIDIA (OptiX and CUDA) kernels (off: processor only, a quicker check)"
+        type: boolean
+        default: true
+      cuda_archs:
+        description: "CUDA binaries (sm_*) and PTX (compute_*)"
+        type: string
+        default: "sm_61;sm_75;sm_86;sm_89;sm_120;compute_75"
+      release:
+        description: "Publish the pack as a release (tag: pack-<version>)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["host/**", ".github/workflows/build-windows.yml", "VERSION"]
+
+permissions:
+  contents: write
+
+env:
+  CYCLES_TAG: v5.2.0
+  OPTIX_TAG: v8.1.0
+  CUDA_VERSION: 12.9.1
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: This repository
+        uses: actions/checkout@v4
+        with:
+          path: akar-render
+
+      - name: Settings for this run
+        id: cfg
+        shell: pwsh
+        run: |
+          # (a push builds for the processor only, as a quick check; the full pack is started by hand)
+          $gpu = if ('${{ github.event_name }}' -eq 'push') { 'false' } else { '${{ inputs.gpu }}' }
+          $archs = '${{ inputs.cuda_archs }}'
+          if (-not $archs) { $archs = 'sm_61;sm_75;sm_86;sm_89;sm_120;compute_75' }
+          $version = (Get-Content akar-render/VERSION -Raw).Trim()
+          "gpu=$gpu" >> $env:GITHUB_OUTPUT
+          "archs=$archs" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "GPU kernels: $gpu; archs: $archs; pack $version"
+
+      - name: Cycles source
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:CYCLES_TAG https://projects.blender.org/blender/cycles.git cycles
+          if ($LASTEXITCODE -ne 0) { git clone --depth 1 --branch $env:CYCLES_TAG https://github.com/blender/cycles.git cycles }
+          Get-Content akar-render/host/cycles-app-append.cmake | Add-Content cycles/src/app/CMakeLists.txt
+
+      - name: Cache of Cycles' precompiled libraries
+        uses: actions/cache@v4
+        with:
+          path: cycles/lib/windows_x64
+          key: cycles-libs-windows-x64-${{ env.CYCLES_TAG }}-v1
+
+      - name: Precompiled libraries (Blender's, via git LFS)
+        shell: pwsh
+        working-directory: cycles
+        run: |
+          git lfs install
+          if (-not (Test-Path lib/windows_x64/.git) -and -not (Test-Path lib/windows_x64/openimageio)) {
+            python src/cmake/make_update.py --no-cycles
+          } else {
+            Write-Host "Libraries from the cache"
+          }
+          Get-ChildItem lib/windows_x64 | Select-Object -First 40 | Format-Table Name
+
+      - name: CUDA toolkit
+        if: steps.cfg.outputs.gpu == 'true'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration", "nvrtc", "nvrtc_dev"]'
+
+      - name: OptiX headers
+        if: steps.cfg.outputs.gpu == 'true'
+        shell: pwsh
+        run: git clone --depth 1 --branch $env:OPTIX_TAG https://github.com/NVIDIA/optix-dev.git optix
+
+      - name: Configure
+        shell: pwsh
+        working-directory: cycles
+        run: |
+          $gpu = '${{ steps.cfg.outputs.gpu }}' -eq 'true'
+          $cmakeArgs = @(
+            '-B', 'build', '-G', 'Visual Studio 17 2022', '-A', 'x64',
+            "-DAKAR_RENDER_DIR=$((Resolve-Path ../akar-render/host).Path -replace '\\','/')",
+            '-DWITH_CYCLES_HYDRA_RENDER_DELEGATE=OFF', '-DWITH_CYCLES_USD=OFF',
+            '-DWITH_CYCLES_OSL=OFF', '-DWITH_CYCLES_ALEMBIC=OFF',
+            '-DWITH_CYCLES_OPENVDB=OFF', '-DWITH_CYCLES_NANOVDB=OFF',
+            '-DWITH_CYCLES_DEVICE_HIP=OFF', '-DWITH_CYCLES_DEVICE_ONEAPI=OFF',
+            '-DWITH_CYCLES_EMBREE=ON', '-DWITH_CYCLES_OPENIMAGEDENOISE=ON'
+          )
+          if ($gpu) {
+            $cmakeArgs += @(
+              '-DWITH_CYCLES_DEVICE_CUDA=ON', '-DWITH_CYCLES_DEVICE_OPTIX=ON',
+              '-DWITH_CYCLES_CUDA_BINARIES=ON',
+              "-DCYCLES_CUDA_BINARIES_ARCH=${{ steps.cfg.outputs.archs }}",
+              "-DOPTIX_ROOT_DIR=$((Resolve-Path ../optix).Path -replace '\\','/')"
+            )
+          } else {
+            $cmakeArgs += @('-DWITH_CYCLES_DEVICE_CUDA=OFF', '-DWITH_CYCLES_DEVICE_OPTIX=OFF')
+          }
+          cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build
+        shell: pwsh
+        working-directory: cycles
+        run: |
+          cmake --build build --config Release --target install --parallel 4 -- /m:4 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem install -Recurse | Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 220
+
+      - name: Check it runs
+        shell: pwsh
+        working-directory: cycles/install
+        run: |
+          ./akar-render.exe --version
+          ./akar-render.exe --list-devices
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $v = '${{ steps.cfg.outputs.version }}'
+          $pack = "akar-render-pack-$v"
+          New-Item -ItemType Directory $pack | Out-Null
+          Copy-Item cycles/install/* $pack -Recurse
+          Remove-Item "$pack/cycles.exe" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory "$pack/licenses" -Force | Out-Null
+          Copy-Item cycles/LICENSE "$pack/licenses/Cycles-LICENSE.txt"
+          Copy-Item cycles/src/doc/license/*.txt "$pack/licenses/" -ErrorAction SilentlyContinue
+          Get-ChildItem cycles/lib/windows_x64 -Recurse -Include LICENSE*,COPYING*,*license*.txt -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName ("$pack/licenses/" + $_.Directory.Name + "-" + $_.Name) -ErrorAction SilentlyContinue }
+          Copy-Item akar-render/LICENSE "$pack/licenses/akar-render-LICENSE.txt"
+          Copy-Item akar-render/NOTICE.md "$pack/NOTICE.md"
+          '{ "version": "' + $v + '", "cycles": "${{ env.CYCLES_TAG }}", "gpu": ${{ steps.cfg.outputs.gpu }}, "archs": "${{ steps.cfg.outputs.archs }}", "commit": "${{ github.sha }}" }' | Set-Content "$pack/pack.json"
+          Compress-Archive -Path "$pack/*" -DestinationPath "$pack.zip" -CompressionLevel Optimal
+          $h = (Get-FileHash "$pack.zip" -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item "$pack.zip").Length
+          '{ "version": "' + $v + '", "file": "' + "$pack.zip" + '", "size": ' + $size + ', "sha256": "' + $h + '" }' | Set-Content pack-latest.json
+          Get-Content pack-latest.json
+
+      - name: Keep the pack (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: akar-render-pack-${{ steps.cfg.outputs.version }}${{ steps.cfg.outputs.gpu == 'true' && '' || '-cpu' }}
+          path: |
+            akar-render-pack-*.zip
+            pack-latest.json
+          retention-days: 30
+
+      - name: Release
+        if: inputs.release && steps.cfg.outputs.gpu == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: akar-render
+        run: |
+          $v = '${{ steps.cfg.outputs.version }}'
+          gh release create "pack-$v" "../akar-render-pack-$v.zip" "../pack-latest.json" --title "Render pack $v" --notes "Akar's photoreal render pack: akar-render on Cycles ${{ env.CYCLES_TAG }}, NVIDIA OptiX/CUDA (${{ steps.cfg.outputs.archs }}) and processor. See NOTICE.md for the licences."
