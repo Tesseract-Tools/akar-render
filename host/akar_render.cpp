@@ -18,7 +18,8 @@
  *
  * A line "stop" on standard input ends the render early, keeping what's done.
  * The pictures are 32-bit float RGBA, linear (scene-referred), top row first, as a small header
- * ("AKRI", width, height, samples) and the pixels; Akar applies exposure and the tone curve.
+ * ("AKRI", width, height, samples) and the pixels (RGB light; A: 1 where the model is, 0 where
+ * the sky is seen); Akar applies exposure and the tone curve.
  */
 
 #include <atomic>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -73,10 +75,19 @@ static void say(const std::string &line)
   std::fflush(stdout);
 }
 
+/* Ends the program at once. (Not exit(): the thread waiting for "stop" holds standard input,
+ * and exit()'s tidying up of the standard streams would wait for it for ever.) */
+[[noreturn]] static void quit(const int code)
+{
+  std::fflush(stdout);
+  std::fflush(stderr);
+  std::_Exit(code);
+}
+
 [[noreturn]] static void fail(const std::string &message)
 {
   say("ERROR " + message);
-  std::exit(1);
+  quit(1);
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -132,16 +143,21 @@ static Transform tfm12(const xml_node &n, const char *name)
   return t;
 }
 
-/* A frame whose -Z points along `dir` (where lights shine), placed at `pos`. */
-static Transform facing(const float3 pos, float3 dir)
+/* A frame whose -Z points along `dir` (where lights shine), placed at `pos`; its X as near
+ * `along` as it can be (an area light's length), when that's given. */
+static Transform facing(const float3 pos, float3 dir, const float3 along = zero_float3())
 {
   dir = safe_normalize(dir);
   if (len_squared(dir) < 1e-12f) {
     dir = make_float3(0.0f, 0.0f, -1.0f);
   }
   const float3 z = -dir;
-  const float3 helper = fabsf(z.z) < 0.9f ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
-  const float3 x = safe_normalize(cross(helper, z));
+  float3 x = along - z * dot(along, z);
+  if (len_squared(x) < 1e-8f) {
+    const float3 helper = fabsf(z.z) < 0.9f ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
+    x = cross(helper, z);
+  }
+  x = safe_normalize(x);
   const float3 y = cross(z, x);
   Transform t;
   t.x = make_float4(x.x, y.x, z.x, pos.x);
@@ -378,12 +394,12 @@ static void make_light(Scene *scene, const xml_node &n)
   used.push_back_slow(scene->default_light);
   light->set_used_shaders(used);
   Object *object = scene->create_node<Object>();
-  object->set_tfm(facing(pos, dir));
+  object->set_tfm(facing(pos, dir, f3(n, "axis_u", zero_float3())));
   object->set_visibility(PATH_RAY_VISIBILITY_ALL & ~PATH_RAY_VISIBILITY_CAMERA);
   object->set_geometry(light);
 }
 
-static void make_world(Scene *scene, const xml_node &world, const xml_node &sun)
+static void make_world(Scene *scene, const std::string &folder, const xml_node &world, const xml_node &sun)
 {
   Shader *bg = scene->default_background;
   unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
@@ -398,10 +414,39 @@ static void make_world(Scene *scene, const xml_node &world, const xml_node &sun)
     sky->set_ground_albedo(f1(world, "ground_albedo", 0.3f));
     graph->connect(sky->output("Color"), back->input("Color"));
   }
+  else if (kind == "texture") {
+    /* A 360-degree picture (equirectangular .hdr or .exr), turned about the vertical by
+     * "rotation" (radians, anticlockwise seen from above). */
+    TextureCoordinateNode *coords = graph->create_node<TextureCoordinateNode>();
+    MappingNode *turn = graph->create_node<MappingNode>();
+    turn->set_mapping_type(NODE_MAPPING_TYPE_POINT);
+    turn->set_rotation(make_float3(0.0f, 0.0f, -f1(world, "rotation", 0.0f)));
+    EnvironmentTextureNode *env = graph->create_node<EnvironmentTextureNode>();
+    env->set_filename(ustring(path_join(folder, world.attribute("texture").value())));
+    env->set_colorspace(u_colorspace_data); /* (.hdr and .exr are linear already) */
+    env->set_interpolation(INTERPOLATION_LINEAR);
+    env->set_projection(NODE_ENVIRONMENT_EQUIRECTANGULAR);
+    graph->connect(coords->output("Generated"), turn->input("Vector"));
+    graph->connect(turn->output("Vector"), env->input("Vector"));
+    graph->connect(env->output("Color"), back->input("Color"));
+  }
   else {
     back->set_color(f3(world, "color", make_float3(0.8f, 0.85f, 0.9f)));
   }
-  graph->connect(back->output("Background"), graph->output()->input("Surface"));
+  ShaderOutput *surface = back->output("Background");
+  if (!world.attribute("camera_color").empty()) {
+    /* What the camera sees straight on is a plain colour; the light still comes from the sky. */
+    BackgroundNode *plain = graph->create_node<BackgroundNode>();
+    plain->set_color(f3(world, "camera_color", one_float3()));
+    plain->set_strength(f1(world, "camera_strength", 1.0f));
+    LightPathNode *path = graph->create_node<LightPathNode>();
+    MixClosureNode *mix = graph->create_node<MixClosureNode>();
+    graph->connect(path->output("Is Camera Ray"), mix->input("Fac"));
+    graph->connect(back->output("Background"), mix->input("Closure1"));
+    graph->connect(plain->output("Background"), mix->input("Closure2"));
+    surface = mix->output("Closure");
+  }
+  graph->connect(surface, graph->output()->input("Surface"));
   bg->set_graph(std::move(graph));
   bg->tag_update(scene);
 
@@ -509,7 +554,7 @@ static Built build_scene(Scene *scene, const SceneFile &file)
     make_light(scene, l);
     lights++;
   }
-  make_world(scene, root.child("world"), root.child("sun"));
+  make_world(scene, file.folder, root.child("world"), root.child("sun"));
   make_camera(scene, root.child("camera"), built.width, built.height);
   say(string_printf("SCENE %zu materials %zu meshes %zu objects %zu lights",
                     built.materials.size(), built.meshes.size(), objects, lights));
@@ -557,6 +602,14 @@ class PictureDriver : public OutputDriver {
     std::vector<float> px(size_t(w) * size_t(h) * 4);
     if (!tile.get_pass_pixels("combined", 4, px.data())) {
       return false;
+    }
+    /* The alpha says where the model is (1) and where the sky or background is seen (0), from
+     * the depth: Akar's automatic exposure looks at the model, not at what's outside. */
+    std::vector<float> depth(size_t(w) * size_t(h));
+    if (tile.get_pass_pixels("depth", 1, depth.data())) {
+      for (size_t i = 0; i < depth.size(); i++) {
+        px[i * 4 + 3] = (depth[i] > 0.0f && depth[i] < 1e8f) ? 1.0f : 0.0f;
+      }
     }
     const std::string path = path_join(folder_, name);
     const std::string temp = path + ".part";
@@ -697,19 +750,22 @@ int main(const int argc, const char **argv)
     Pass *pass = scene->create_node<Pass>();
     pass->set_name(ustring("combined"));
     pass->set_type(PASS_COMBINED);
+    Pass *depth = scene->create_node<Pass>();
+    depth->set_name(ustring("depth"));
+    depth->set_type(PASS_DEPTH);
   }
 
   const auto started = std::chrono::steady_clock::now();
   auto seconds = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
   session->progress.set_update_callback([&]() {
     static std::chrono::steady_clock::time_point last{};
+    const int s = session->progress.get_current_sample();
+    done_samples = s; /* (every time: the final picture is written with it) */
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::milliseconds(250)) {
       return;
     }
     last = now;
-    const int s = session->progress.get_current_sample();
-    done_samples = s;
     double total = 0.0, render = 0.0;
     session->progress.get_time(total, render);
     const double p = session->progress.get_progress();
@@ -749,5 +805,5 @@ int main(const int argc, const char **argv)
     fail("the render ended without a picture");
   }
   say(string_printf("DONE %s %.1f", path_join(out_folder, "final.akri").c_str(), seconds()));
-  return 0;
+  quit(0);
 }
