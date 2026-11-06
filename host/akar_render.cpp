@@ -359,6 +359,25 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
   return mesh;
 }
 
+/* The lamps' and the sun's shader: plain white light, as strong as the light says. (Cycles' own
+ * default_light shader is an emission of strength 0 — a light given it gives no light at all.) */
+static Shader *light_shader(Scene *scene)
+{
+  static Shader *made = nullptr;
+  if (made == nullptr) {
+    unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
+    EmissionNode *emission = graph->create_node<EmissionNode>();
+    emission->set_color(one_float3());
+    emission->set_strength(1.0f);
+    graph->connect(emission->output("Emission"), graph->output()->input("Surface"));
+    made = scene->create_node<Shader>();
+    made->name = "akar_light";
+    made->set_graph(std::move(graph));
+    made->tag_update(scene);
+  }
+  return made;
+}
+
 static void make_light(Scene *scene, const xml_node &n)
 {
   const std::string type = n.attribute("type").value();
@@ -391,7 +410,7 @@ static void make_light(Scene *scene, const xml_node &n)
   light->set_cast_shadow(true);
   light->set_use_mis(true);
   array<Node *> used;
-  used.push_back_slow(scene->default_light);
+  used.push_back_slow(light_shader(scene));
   light->set_used_shaders(used);
   Object *object = scene->create_node<Object>();
   object->set_tfm(facing(pos, dir, f3(n, "axis_u", zero_float3())));
@@ -457,7 +476,7 @@ static void make_world(Scene *scene, const std::string &folder, const xml_node &
     light->set_cast_shadow(true);
     light->set_use_mis(true);
     array<Node *> used;
-    used.push_back_slow(scene->default_light);
+    used.push_back_slow(light_shader(scene));
     light->set_used_shaders(used);
     Object *object = scene->create_node<Object>();
     /* "dir" points to the sun; the light travels the other way. */
