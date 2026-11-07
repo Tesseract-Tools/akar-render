@@ -720,8 +720,8 @@ class PictureDriver : public OutputDriver {
     std::vector<float> model, all;
     for (size_t i = 0; i < size_t(w) * size_t(h); i++) {
       const float y = 0.2126f * px[i * 4] + 0.7152f * px[i * 4 + 1] + 0.0722f * px[i * 4 + 2];
-      if (!std::isfinite(y) || y <= 0.0f) {
-        continue;
+      if (!std::isfinite(y) || y < 0.0f) {
+        continue; /* (a pixel no light reached counts: leaving them out made the room look brighter than it is) */
       }
       all.push_back(y);
       if (has_depth && depth[i] > 0.0f && depth[i] < 1e8f) {
@@ -732,8 +732,13 @@ class PictureDriver : public OutputDriver {
     if (use.empty()) {
       return;
     }
+    double sum = 0.0;
+    for (const float y : use) {
+      sum += y;
+    }
     std::nth_element(use.begin(), use.begin() + use.size() / 2, use.end());
-    measured = use[use.size() / 2];
+    const float middle = use[use.size() / 2];
+    measured = middle > 0.0f ? middle : float(sum / double(use.size()));
   }
 
   bool write(const Tile &tile, const char *name)
@@ -833,9 +838,10 @@ int main(const int argc, const char **argv)
   /* 1.0.5: Cycles judges a pixel clean enough by its light before any exposure, as if it were
    * shown as it is; a room lit through its windows can be a hundred times darker than its picture
    * shows it, so its shade was taken for clean after a few dozen samples, grainy, and the noise
-   * remover smoothed the grain into scratches. A first small picture (an eighth across, a few
-   * samples) measures how bright the model is, and the render is exposed to that (the exposure
-   * is taken off again in the file). --exposure e sets it instead (0: measured). */
+   * remover smoothed the grain into scratches. A first small picture (an eighth across, 16
+   * samples, in a session of its own) measures how bright the model is, and the render is
+   * exposed to that (the exposure is taken off again in the file). --exposure e sets it instead
+   * (0: measured). */
   float film_exposure = 0.0f;
   bool denoise = true, list = false;
   for (int i = 1; i < argc; i++) {
@@ -889,60 +895,79 @@ int main(const int argc, const char **argv)
   scp.shadingsystem = SHADINGSYSTEM_SVM;
   say("DEVICE " + Device::string_from_type(sp.device.type) + " " + sp.device.description);
 
-  unique_ptr<Session> session = make_unique<Session>(sp, scp);
+  /* A session with the scene built in it. 1.0.5: twice when the brightness is measured, a
+   * session each (one session rendering twice, with the exposure changed between, left the
+   * second picture without its noise removed). */
   std::atomic<int> done_samples{0};
-  auto driver = make_unique<PictureDriver>(out_folder, &done_samples);
-  PictureDriver *picture = driver.get();
-  session->set_output_driver(std::move(driver));
-
-  Scene *scene = session->scene.get();
+  std::mutex session_mutex; /* (the "stop" listener and the change of session) */
+  unique_ptr<Session> session;
+  PictureDriver *picture = nullptr;
   Built built;
-  {
-    const thread_scoped_lock lock(scene->mutex);
-    built = build_scene(scene, file);
-    Integrator *in = scene->integrator;
-    in->set_use_adaptive_sampling(true);
-    in->set_adaptive_threshold(threshold);
-    in->set_max_bounce(12);
-    in->set_max_diffuse_bounce(4);
-    in->set_max_glossy_bounce(4);
-    in->set_max_transmission_bounce(8);
-    in->set_transparent_max_bounce(16);
-    in->set_sample_clamp_indirect(10.0f);
-    in->set_filter_glossy(filter_glossy);
-    in->set_caustics_reflective(caustics);
-    in->set_caustics_refractive(caustics);
-    in->set_use_light_tree(true);
-    in->set_use_denoise(denoise);
-    in->set_denoiser_type(DENOISER_OPENIMAGEDENOISE);
-    in->set_denoiser_prefilter(DENOISER_PREFILTER_ACCURATE);
-    Pass *pass = scene->create_node<Pass>();
-    pass->set_name(ustring("combined"));
-    pass->set_type(PASS_COMBINED);
-    Pass *depth = scene->create_node<Pass>();
-    depth->set_name(ustring("depth"));
-    depth->set_type(PASS_DEPTH);
-  }
-
   const auto started = std::chrono::steady_clock::now();
   auto seconds = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
-  session->progress.set_update_callback([&]() {
-    static std::chrono::steady_clock::time_point last{};
-    const int s = session->progress.get_current_sample();
-    done_samples = s; /* (every time: the final picture is written with it) */
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::milliseconds(250)) {
-      return;
+  auto open_session = [&](const float exposure, const bool measuring) {
+    auto made = make_unique<Session>(sp, scp);
+    auto driver = make_unique<PictureDriver>(out_folder, &done_samples);
+    PictureDriver *made_picture = driver.get();
+    made_picture->measuring = measuring;
+    made_picture->exposure = exposure;
+    made->set_output_driver(std::move(driver));
+    Scene *scene = made->scene.get();
+    {
+      const thread_scoped_lock lock(scene->mutex);
+      built = build_scene(scene, file);
+      Integrator *in = scene->integrator;
+      in->set_use_adaptive_sampling(true);
+      in->set_adaptive_threshold(threshold);
+      in->set_max_bounce(12);
+      in->set_max_diffuse_bounce(4);
+      in->set_max_glossy_bounce(4);
+      in->set_max_transmission_bounce(8);
+      in->set_transparent_max_bounce(16);
+      in->set_sample_clamp_indirect(10.0f);
+      in->set_filter_glossy(filter_glossy);
+      in->set_caustics_reflective(caustics);
+      in->set_caustics_refractive(caustics);
+      in->set_use_light_tree(true);
+      in->set_use_denoise(denoise || measuring);
+      in->set_denoiser_type(DENOISER_OPENIMAGEDENOISE);
+      in->set_denoiser_prefilter(DENOISER_PREFILTER_ACCURATE);
+      scene->film->set_exposure(exposure);
+      Pass *pass = scene->create_node<Pass>();
+      pass->set_name(ustring("combined"));
+      pass->set_type(PASS_COMBINED);
+      Pass *depth = scene->create_node<Pass>();
+      depth->set_name(ustring("depth"));
+      depth->set_type(PASS_DEPTH);
     }
-    last = now;
-    double total = 0.0, render = 0.0;
-    session->progress.get_time(total, render);
-    const double p = session->progress.get_progress();
-    const double left = p > 0.02 ? total * (1.0 - p) / p : -1.0;
-    if (!picture->measuring) {
+    Session *raw = made.get();
+    made->progress.set_update_callback([&, raw, made_picture]() {
+      static std::chrono::steady_clock::time_point last{};
+      const int s = raw->progress.get_current_sample();
+      if (made_picture->measuring) {
+        return;
+      }
+      done_samples = s; /* (every time: the final picture is written with it) */
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last < std::chrono::milliseconds(250)) {
+        return;
+      }
+      last = now;
+      double total = 0.0, render = 0.0;
+      raw->progress.get_time(total, render);
+      const double p = raw->progress.get_progress();
+      const double left = p > 0.02 ? total * (1.0 - p) / p : -1.0;
       say(string_printf("PROGRESS %.4f %d %d %.1f %.1f", p, s, samples, seconds(), left));
-    }
-  });
+    });
+    const std::lock_guard<std::mutex> guard(session_mutex);
+    session = std::move(made);
+    picture = made_picture;
+  };
+  auto close_session = [&]() {
+    const std::lock_guard<std::mutex> guard(session_mutex);
+    session.reset();
+    picture = nullptr;
+  };
 
   /* "stop" on standard input ends the render, keeping what's done. */
   std::atomic<bool> stop_asked{false};
@@ -951,7 +976,8 @@ int main(const int argc, const char **argv)
     while (std::getline(std::cin, line)) {
       if (line.rfind("stop", 0) == 0) {
         stop_asked = true;
-        if (!picture->measuring) {
+        const std::lock_guard<std::mutex> guard(session_mutex);
+        if (session && picture && !picture->measuring) {
           session->set_time_limit(0.001);
           session->set_samples(std::max(1, session->progress.get_current_sample()));
         }
@@ -961,52 +987,35 @@ int main(const int argc, const char **argv)
   });
   listener.detach();
 
-  /* How bright the model is: a small picture first (an eighth across, a few samples, no noise
-   * removing), unless the exposure was given. */
+  /* How bright the model is: a small picture first (an eighth across, 16 samples, its noise
+   * removed), unless the exposure was given. */
   float exposure = film_exposure;
   if (exposure <= 0.0f) {
-    const int mw = std::max(16, built.width / 8), mh = std::max(16, built.height / 8);
-    {
-      const thread_scoped_lock lock(scene->mutex);
-      scene->camera->set_full_width(mw);
-      scene->camera->set_full_height(mh);
-      scene->integrator->set_use_denoise(false);
-      scene->integrator->set_use_adaptive_sampling(false);
-    }
+    open_session(1.0f, true);
     SessionParams measure_params = sp;
     measure_params.samples = 16;
     measure_params.time_limit = 0.0;
     BufferParams mb;
-    mb.width = mw;
-    mb.height = mh;
-    mb.full_width = mw;
-    mb.full_height = mh;
-    picture->measuring = true;
+    mb.width = std::max(16, built.width / 8);
+    mb.height = std::max(16, built.height / 8);
+    mb.full_width = mb.width;
+    mb.full_height = mb.height;
     session->reset(measure_params, mb);
     session->start();
     session->wait();
-    picture->measuring = false;
-    exposure = picture->measured > 0.0f ? std::clamp(0.18f / picture->measured, 0.001f, 100000.0f) : 1.0f;
-    say(string_printf("EXPOSURE %.6g %.6g %.1f", exposure, picture->measured, seconds()));
-    {
-      const thread_scoped_lock lock(scene->mutex);
-      scene->camera->set_full_width(built.width);
-      scene->camera->set_full_height(built.height);
-      scene->integrator->set_use_denoise(denoise);
-      scene->integrator->set_use_adaptive_sampling(true);
+    const std::string measure_error = session->progress.get_error_message();
+    const float measured = picture->measured;
+    close_session();
+    if (!measure_error.empty()) {
+      fail(measure_error);
     }
-    if (!session->progress.get_error_message().empty()) {
-      fail(session->progress.get_error_message());
-    }
+    exposure = measured > 0.0f ? std::clamp(0.18f / measured, 0.001f, 100000.0f) : 1.0f;
+    say(string_printf("EXPOSURE %.6g %.6g %.1f", exposure, measured, seconds()));
   }
-  {
-    const thread_scoped_lock lock(scene->mutex);
-    scene->film->set_exposure(exposure);
-  }
-  picture->exposure = exposure;
   if (stop_asked) {
     sp.samples = 1; /* (stopped while measuring: a picture at once) */
   }
+  open_session(exposure, false);
 
   BufferParams bp;
   bp.width = built.width;
