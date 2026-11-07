@@ -770,6 +770,11 @@ int main(const int argc, const char **argv)
   int samples = 512, threads = 0;
   float threshold = 0.01f;
   double time_limit = 0.0;
+  /* 1.0.5: glossy light after a bounce softened, as Blender has it by default (its "Filter
+   * Glossy" of 1): window light bouncing off a shiny floor or cabinet into the shade is otherwise
+   * found by chance, and is grain there. */
+  float filter_glossy = 1.0f;
+  bool caustics = true;
   bool denoise = true, list = false;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
@@ -785,6 +790,8 @@ int main(const int argc, const char **argv)
     else if (a == "--time-limit") time_limit = std::atof(next().c_str());
     else if (a == "--threads") threads = std::atoi(next().c_str());
     else if (a == "--no-denoise") denoise = false;
+    else if (a == "--filter-glossy") filter_glossy = std::max(0.0f, float(std::atof(next().c_str())));
+    else if (a == "--no-caustics") caustics = false;
     else if (a == "--out") out_folder = next();
     else if (a == "--list-devices") list = true;
     else if (a == "--version") { say(std::string("akar-render 1 (Cycles ") + CYCLES_VERSION_STRING + ")"); return 0; }
@@ -797,7 +804,7 @@ int main(const int argc, const char **argv)
     return 0;
   }
   if (scene_path.empty()) {
-    say("usage: akar-render <scene.akrs> [--out folder] [--device auto|optix|cuda|cpu] [--samples n] [--threshold t] [--time-limit s] [--no-denoise]");
+    say("usage: akar-render <scene.akrs> [--out folder] [--device auto|optix|cuda|cpu] [--samples n] [--threshold t] [--time-limit s] [--no-denoise] [--filter-glossy f] [--no-caustics]");
     return 2;
   }
   if (out_folder.empty()) {
@@ -839,6 +846,9 @@ int main(const int argc, const char **argv)
     in->set_max_transmission_bounce(8);
     in->set_transparent_max_bounce(16);
     in->set_sample_clamp_indirect(10.0f);
+    in->set_filter_glossy(filter_glossy);
+    in->set_caustics_reflective(caustics);
+    in->set_caustics_refractive(caustics);
     in->set_use_light_tree(true);
     in->set_use_denoise(denoise);
     in->set_denoiser_type(DENOISER_OPENIMAGEDENOISE);
