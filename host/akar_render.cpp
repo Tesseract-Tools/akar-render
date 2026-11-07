@@ -12,6 +12,9 @@
  *
  *   DEVICE <type> <name>
  *   PROGRESS <0..1> <samples done> <samples asked> <seconds so far> <seconds left, -1 unknown>
+ *   EXPOSURE <e> <middle> <seconds>  (1.0.5: the exposure rendered with, from the model's
+ *                           middle brightness in a first small picture; the files hold the light
+ *                           without it)
  *   PREVIEW <path>          (a newer picture is there)
  *   DONE <path> <seconds>
  *   ERROR <message>
@@ -22,6 +25,7 @@
  * the sky is seen); Akar applies exposure and the tone curve.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -667,6 +671,10 @@ class PictureDriver : public OutputDriver {
 
   void write_render_tile(const Tile &tile) override
   {
+    if (measuring) {
+      measure(tile);
+      return;
+    }
     if (write(tile, "final.akri")) {
       final_written = true;
     }
@@ -674,6 +682,9 @@ class PictureDriver : public OutputDriver {
 
   bool update_render_tile(const Tile &tile) override
   {
+    if (measuring) {
+      return false;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - last_ < std::chrono::milliseconds(900)) {
       return false;
@@ -688,7 +699,43 @@ class PictureDriver : public OutputDriver {
 
   bool final_written = false;
 
+  /* 1.0.5: the first, small picture only measures how bright the model is (see main). */
+  std::atomic<bool> measuring{false};
+  /* The model's middle brightness in it (-1: none seen). */
+  float measured = -1.0f;
+  /* The film's exposure in the render, taken off again as the picture is written (the file
+   * holds the light as it is: Akar exposes it). */
+  float exposure = 1.0f;
+
  private:
+  void measure(const Tile &tile)
+  {
+    const int w = tile.size.x, h = tile.size.y;
+    std::vector<float> px(size_t(w) * size_t(h) * 4);
+    std::vector<float> depth(size_t(w) * size_t(h));
+    if (!tile.get_pass_pixels("combined", 4, px.data())) {
+      return;
+    }
+    const bool has_depth = tile.get_pass_pixels("depth", 1, depth.data());
+    std::vector<float> model, all;
+    for (size_t i = 0; i < size_t(w) * size_t(h); i++) {
+      const float y = 0.2126f * px[i * 4] + 0.7152f * px[i * 4 + 1] + 0.0722f * px[i * 4 + 2];
+      if (!std::isfinite(y) || y <= 0.0f) {
+        continue;
+      }
+      all.push_back(y);
+      if (has_depth && depth[i] > 0.0f && depth[i] < 1e8f) {
+        model.push_back(y);
+      }
+    }
+    std::vector<float> &use = model.size() > 16 ? model : all;
+    if (use.empty()) {
+      return;
+    }
+    std::nth_element(use.begin(), use.begin() + use.size() / 2, use.end());
+    measured = use[use.size() / 2];
+  }
+
   bool write(const Tile &tile, const char *name)
   {
     if (!(tile.size == tile.full_size)) {
@@ -698,6 +745,14 @@ class PictureDriver : public OutputDriver {
     std::vector<float> px(size_t(w) * size_t(h) * 4);
     if (!tile.get_pass_pixels("combined", 4, px.data())) {
       return false;
+    }
+    if (exposure != 1.0f) {
+      const float k = 1.0f / exposure;
+      for (size_t i = 0; i < size_t(w) * size_t(h); i++) {
+        px[i * 4] *= k;
+        px[i * 4 + 1] *= k;
+        px[i * 4 + 2] *= k;
+      }
     }
     /* The alpha says where the model is (1) and where the sky or background is seen (0), from
      * the depth: Akar's automatic exposure looks at the model, not at what's outside. */
@@ -775,6 +830,13 @@ int main(const int argc, const char **argv)
    * found by chance, and is grain there. */
   float filter_glossy = 1.0f;
   bool caustics = true;
+  /* 1.0.5: Cycles judges a pixel clean enough by its light before any exposure, as if it were
+   * shown as it is; a room lit through its windows can be a hundred times darker than its picture
+   * shows it, so its shade was taken for clean after a few dozen samples, grainy, and the noise
+   * remover smoothed the grain into scratches. A first small picture (an eighth across, a few
+   * samples) measures how bright the model is, and the render is exposed to that (the exposure
+   * is taken off again in the file). --exposure e sets it instead (0: measured). */
+  float film_exposure = 0.0f;
   bool denoise = true, list = false;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
@@ -792,6 +854,7 @@ int main(const int argc, const char **argv)
     else if (a == "--no-denoise") denoise = false;
     else if (a == "--filter-glossy") filter_glossy = std::max(0.0f, float(std::atof(next().c_str())));
     else if (a == "--no-caustics") caustics = false;
+    else if (a == "--exposure") film_exposure = std::max(0.0f, float(std::atof(next().c_str())));
     else if (a == "--out") out_folder = next();
     else if (a == "--list-devices") list = true;
     else if (a == "--version") { say(std::string("akar-render 1 (Cycles ") + CYCLES_VERSION_STRING + ")"); return 0; }
@@ -804,7 +867,7 @@ int main(const int argc, const char **argv)
     return 0;
   }
   if (scene_path.empty()) {
-    say("usage: akar-render <scene.akrs> [--out folder] [--device auto|optix|cuda|cpu] [--samples n] [--threshold t] [--time-limit s] [--no-denoise] [--filter-glossy f] [--no-caustics]");
+    say("usage: akar-render <scene.akrs> [--out folder] [--device auto|optix|cuda|cpu] [--samples n] [--threshold t] [--time-limit s] [--no-denoise] [--filter-glossy f] [--no-caustics] [--exposure e]");
     return 2;
   }
   if (out_folder.empty()) {
@@ -876,21 +939,74 @@ int main(const int argc, const char **argv)
     session->progress.get_time(total, render);
     const double p = session->progress.get_progress();
     const double left = p > 0.02 ? total * (1.0 - p) / p : -1.0;
-    say(string_printf("PROGRESS %.4f %d %d %.1f %.1f", p, s, samples, seconds(), left));
+    if (!picture->measuring) {
+      say(string_printf("PROGRESS %.4f %d %d %.1f %.1f", p, s, samples, seconds(), left));
+    }
   });
 
   /* "stop" on standard input ends the render, keeping what's done. */
+  std::atomic<bool> stop_asked{false};
   std::thread listener([&]() {
     std::string line;
     while (std::getline(std::cin, line)) {
       if (line.rfind("stop", 0) == 0) {
-        session->set_time_limit(0.001);
-        session->set_samples(std::max(1, session->progress.get_current_sample()));
+        stop_asked = true;
+        if (!picture->measuring) {
+          session->set_time_limit(0.001);
+          session->set_samples(std::max(1, session->progress.get_current_sample()));
+        }
         break;
       }
     }
   });
   listener.detach();
+
+  /* How bright the model is: a small picture first (an eighth across, a few samples, no noise
+   * removing), unless the exposure was given. */
+  float exposure = film_exposure;
+  if (exposure <= 0.0f) {
+    const int mw = std::max(16, built.width / 8), mh = std::max(16, built.height / 8);
+    {
+      const thread_scoped_lock lock(scene->mutex);
+      scene->camera->set_full_width(mw);
+      scene->camera->set_full_height(mh);
+      scene->integrator->set_use_denoise(false);
+      scene->integrator->set_use_adaptive_sampling(false);
+    }
+    SessionParams measure_params = sp;
+    measure_params.samples = 16;
+    measure_params.time_limit = 0.0;
+    BufferParams mb;
+    mb.width = mw;
+    mb.height = mh;
+    mb.full_width = mw;
+    mb.full_height = mh;
+    picture->measuring = true;
+    session->reset(measure_params, mb);
+    session->start();
+    session->wait();
+    picture->measuring = false;
+    exposure = picture->measured > 0.0f ? std::clamp(0.18f / picture->measured, 0.001f, 100000.0f) : 1.0f;
+    say(string_printf("EXPOSURE %.6g %.6g %.1f", exposure, picture->measured, seconds()));
+    {
+      const thread_scoped_lock lock(scene->mutex);
+      scene->camera->set_full_width(built.width);
+      scene->camera->set_full_height(built.height);
+      scene->integrator->set_use_denoise(denoise);
+      scene->integrator->set_use_adaptive_sampling(true);
+    }
+    if (!session->progress.get_error_message().empty()) {
+      fail(session->progress.get_error_message());
+    }
+  }
+  {
+    const thread_scoped_lock lock(scene->mutex);
+    scene->film->set_exposure(exposure);
+  }
+  picture->exposure = exposure;
+  if (stop_asked) {
+    sp.samples = 1; /* (stopped while measuring: a picture at once) */
+  }
 
   BufferParams bp;
   bp.width = built.width;
