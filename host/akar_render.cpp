@@ -307,6 +307,7 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
       graph->connect(split->output("Blue"), bsdf->input("Metallic"));
     }
   }
+  NormalMapNode *bumps = nullptr;
   if (ImageTextureNode *normal = texture_node(i1(m, "normal_map", -1), false)) {
     NormalMapNode *nm = graph->create_node<NormalMapNode>();
     nm->set_space(NODE_NORMAL_MAP_TANGENT);
@@ -316,6 +317,43 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
     }
     graph->connect(normal->output("Color"), nm->input("Color"));
     graph->connect(nm->output("Normal"), bsdf->input("Normal"));
+    bumps = nm;
+  }
+
+  if (i1(m, "glass", 0)) {
+    /* 1.0.8: see-through glass (Akar: a plain colour with opacity under 100 %). Before, its
+     * opacity mixed the surface with "nothing there", so its reflections were weakened as much as
+     * its colour: a wine glass at 20 % kept a fifth of an already faint reflection and showed as
+     * grey film. Now the see-through part is clear (tinted by the colour, as much as it's glossy)
+     * with its own reflection on top, as strong as the angle and the reflectivity make it
+     * (Fresnel; reflectivity 50 % = glass's own, IOR 1.5), and sharp or soft as it's glossy. A
+     * matt one keeps a body of its colour (frosted). It's transparent, not refracting, so sunlight
+     * still comes through a window and a single pane isn't bent. */
+    const float alpha = clamp(f1(m, "alpha", 1.0f), 0.0f, 1.0f);
+    const float rough = clamp(f1(m, "roughness", 0.03f), 0.0f, 1.0f);
+    const float gloss = 1.0f - rough;
+    const float3 colour = f3(m, "color", make_float3(0.8f, 0.8f, 0.8f));
+    bsdf->set_alpha(1.0f);
+    TransparentBsdfNode *clear = graph->create_node<TransparentBsdfNode>();
+    clear->set_color(one_float3() + (colour - one_float3()) * (alpha * gloss));
+    GlossyBsdfNode *shine = graph->create_node<GlossyBsdfNode>();
+    shine->set_color(one_float3());
+    shine->set_roughness(rough);
+    FresnelNode *fresnel = graph->create_node<FresnelNode>();
+    fresnel->set_IOR(1.0f + clamp(f1(m, "specular", 0.5f), 0.0f, 1.0f));
+    if (bumps != nullptr) {
+      graph->connect(bumps->output("Normal"), shine->input("Normal"));
+      graph->connect(bumps->output("Normal"), fresnel->input("Normal"));
+    }
+    MixClosureNode *see = graph->create_node<MixClosureNode>();
+    graph->connect(fresnel->output("Fac"), see->input("Fac"));
+    graph->connect(clear->output("BSDF"), see->input("Closure1"));
+    graph->connect(shine->output("BSDF"), see->input("Closure2"));
+    MixClosureNode *glass = graph->create_node<MixClosureNode>();
+    glass->set_fac(alpha * rough); /* (the body: none for clear glass, its colour for frosted) */
+    graph->connect(see->output("Closure"), glass->input("Closure1"));
+    graph->connect(bsdf->output("BSDF"), glass->input("Closure2"));
+    return glass->output("Closure");
   }
 
   return bsdf->output("BSDF");

@@ -14,7 +14,7 @@ to a multiple of 16 from the file's start, then the binary data. Units are metre
   <material name="…" color="r g b (linear)" alpha="1" roughness="0.6" metallic="0" ior="1.5"
             specular="0.5" transmission="0" texture="-1" cutout="0" tint="0" tint_color="r g b"
             roughness_map="-1" metallic_from_map="0" normal_map="-1" normal_strength="1"
-            emission="r g b" emission_strength="0"/>
+            emission="r g b" emission_strength="0" glass="0"/>
   <mesh name="…" vertices="V" triangles="T" offset="byte offset into the data" materials="m0 m1 …"/>
   <object mesh="0" tfm="12 numbers: three rows of a 3 x 4 matrix"/>
   <light type="point|spot|area" position="x y z" dir="x y z" color="r g b" power="watts"
@@ -27,6 +27,14 @@ A mesh's data, in order: positions (V × 3 float32), normals (V × 3 float32), t
 the mesh's `materials`).
 
 `cutout="1"`: the texture's alpha is the surface's (times the material's `alpha`, from 1.0.7).
+
+`glass="1"` (from 1.0.8; Akar 0.13.5 writes it for a plain colour that's see-through): the
+see-through part (1 − `alpha`) is clear, tinted by `color` as much as the surface is glossy, with
+its own reflection on top (Fresnel, IOR 1 + `specular`: 0.5 is glass's 1.5; sharp or soft by
+`roughness`); a matt one keeps a body of its colour (`alpha` × `roughness`). Transparent, not
+refracting: sunlight comes through a window. Older packs ignore it (the surface mixed with
+nothing by `alpha`). `specular` is the reflectivity (0.5 = a dielectric's own; Akar 0.13.5 writes
+each material's).
 
 The pictures akar-render writes (`preview.akri`, `final.akri`): `"AKRI"`, `int32 width, height,
 samples, 0`, then width × height RGBA float32, linear, top row first.
