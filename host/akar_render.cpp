@@ -336,15 +336,27 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
     bsdf->set_alpha(1.0f);
     TransparentBsdfNode *clear = graph->create_node<TransparentBsdfNode>();
     /* (The colour and opacity describe a pane as it's seen in SketchUp or Akar's view; a pane is
-     * usually two faces, so each face takes the square root of the pane's tint: a sliding window,
-     * four faces of grey glass, showed the sky at 15 %, and through two faces it's the pane's own.) */
+     * usually two faces, so each face takes the square root of the pane's tint, and through its
+     * two faces it's the pane's own.) */
     const float3 pane = one_float3() + (colour - one_float3()) * (alpha * gloss);
     clear->set_color(make_float3(sqrtf(fmaxf(pane.x, 0.0f)), sqrtf(fmaxf(pane.y, 0.0f)), sqrtf(fmaxf(pane.z, 0.0f))));
     GlossyBsdfNode *shine = graph->create_node<GlossyBsdfNode>();
     shine->set_color(one_float3());
     shine->set_roughness(rough);
+    const float ior = 1.0f + clamp(f1(m, "specular", 0.5f), 0.0f, 1.0f);
     FresnelNode *fresnel = graph->create_node<FresnelNode>();
-    fresnel->set_IOR(1.0f + clamp(f1(m, "specular", 0.5f), 0.0f, 1.0f));
+    /* (Cycles' Fresnel takes a back face for glass to air: past about 42 degrees all of it
+     * reflects. As this glass doesn't bend the light, a ray through a pane seen at a slant then
+     * stayed inside it, bouncing between its two faces until it ran out of bounces: a window
+     * seen from the side came out black. A thin pane is air to glass on both sides, so a back
+     * face is given 1/IOR, which Cycles turns back into the IOR.) */
+    GeometryNode *geometry = graph->create_node<GeometryNode>();
+    MathNode *side = graph->create_node<MathNode>();
+    side->set_math_type(NODE_MATH_MULTIPLY_ADD);
+    side->set_value2(1.0f / ior - ior);
+    side->set_value3(ior);
+    graph->connect(geometry->output("Backfacing"), side->input("Value1"));
+    graph->connect(side->output("Value"), fresnel->input("IOR"));
     if (bumps != nullptr) {
       graph->connect(bumps->output("Normal"), shine->input("Normal"));
       graph->connect(bumps->output("Normal"), fresnel->input("Normal"));
