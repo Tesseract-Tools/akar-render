@@ -365,6 +365,10 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
   if (used.empty()) {
     used.push_back_slow(scene->default_surface);
   }
+  /* (Cycles' setter takes the array's contents, leaving it empty: count them first. Before 1.0.5
+   * every triangle was given the mesh's first material, so a group painted in several, a picture
+   * in its frame, showed the first all over.) */
+  const size_t used_count = used.size();
   mesh->set_used_shaders(used);
 
   mesh->resize_mesh(int(nv), int(nt));
@@ -379,7 +383,7 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
   }
   array<int> &shaders = mesh->get_shader();
   for (size_t t = 0; t < nt; t++) {
-    shaders[t] = slot[t] < used.size() ? int(slot[t]) : 0;
+    shaders[t] = slot[t] < used_count ? int(slot[t]) : 0;
   }
   std::ranges::fill(mesh->get_smooth(), true);
   mesh->tag_triangles_modified();
