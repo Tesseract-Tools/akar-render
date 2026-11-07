@@ -29,7 +29,8 @@ the mesh's `materials`).
 `cutout="1"`: the texture's alpha is the surface's (times the material's `alpha`, from 1.0.7).
 
 `glass="1"` (from 1.0.8; Akar 0.13.5 writes it for a plain colour that's see-through): the
-see-through part (1 − `alpha`) is clear, tinted by `color` as much as the surface is glossy, with
+see-through part (1 − `alpha`) is clear, tinted by `color` as much as the surface is glossy (the
+tint of a pane: each face takes its square root, a pane being two faces), with
 its own reflection on top (Fresnel, IOR 1 + `specular`: 0.5 is glass's 1.5; sharp or soft by
 `roughness`); a matt one keeps a body of its colour (`alpha` × `roughness`). Transparent, not
 refracting: sunlight comes through a window. Older packs ignore it (the surface mixed with

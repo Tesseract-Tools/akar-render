@@ -335,7 +335,11 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
     const float3 colour = f3(m, "color", make_float3(0.8f, 0.8f, 0.8f));
     bsdf->set_alpha(1.0f);
     TransparentBsdfNode *clear = graph->create_node<TransparentBsdfNode>();
-    clear->set_color(one_float3() + (colour - one_float3()) * (alpha * gloss));
+    /* (The colour and opacity describe a pane as it's seen in SketchUp or Akar's view; a pane is
+     * usually two faces, so each face takes the square root of the pane's tint: a sliding window,
+     * four faces of grey glass, showed the sky at 15 %, and through two faces it's the pane's own.) */
+    const float3 pane = one_float3() + (colour - one_float3()) * (alpha * gloss);
+    clear->set_color(make_float3(sqrtf(fmaxf(pane.x, 0.0f)), sqrtf(fmaxf(pane.y, 0.0f)), sqrtf(fmaxf(pane.z, 0.0f))));
     GlossyBsdfNode *shine = graph->create_node<GlossyBsdfNode>();
     shine->set_color(one_float3());
     shine->set_roughness(rough);
