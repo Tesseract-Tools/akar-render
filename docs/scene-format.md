@@ -26,5 +26,7 @@ A mesh's data, in order: positions (V × 3 float32), normals (V × 3 float32), t
 (V × 2 float32), triangles (T × 3 int32), and each triangle's material (T × uint16, an index into
 the mesh's `materials`).
 
+`cutout="1"`: the texture's alpha is the surface's (times the material's `alpha`, from 1.0.7).
+
 The pictures akar-render writes (`preview.akri`, `final.akri`): `"AKRI"`, `int32 width, height,
 samples, 0`, then width × height RGBA float32, linear, top row first.

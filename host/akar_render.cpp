@@ -15,6 +15,9 @@
  *   EXPOSURE <e> <middle> <seconds>  (1.0.5: the exposure rendered with, from the model's
  *                           middle brightness in a first small picture; the files hold the light
  *                           without it)
+ *   WHITE <r> <g> <b>       (1.0.7: the colour of the light falling on the model in that first
+ *                           picture, its brightness 1: the sky's blue on a façade in shade, a
+ *                           lamp's warmth; Akar balances the picture's colour by it)
  *   PREVIEW <path>          (a newer picture is there)
  *   DONE <path> <seconds>
  *   ERROR <message>
@@ -281,7 +284,19 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
       graph->connect(tex->output("Color"), bsdf->input("Base Color"));
     }
     if (i1(m, "cutout", 0)) {
-      graph->connect(tex->output("Alpha"), bsdf->input("Alpha"));
+      const float alpha = f1(m, "alpha", 1.0f);
+      if (alpha < 0.999f) {
+        /* 1.0.7: a cut-out picture on a material that's see-through itself (leaves at 88 %):
+         * the picture's alpha times the material's. */
+        MathNode *times = graph->create_node<MathNode>();
+        times->set_math_type(NODE_MATH_MULTIPLY);
+        times->set_value2(alpha);
+        graph->connect(tex->output("Alpha"), times->input("Value1"));
+        graph->connect(times->output("Value"), bsdf->input("Alpha"));
+      }
+      else {
+        graph->connect(tex->output("Alpha"), bsdf->input("Alpha"));
+      }
     }
   }
   if (ImageTextureNode *rough = texture_node(i1(m, "roughness_map", -1), false)) {
@@ -419,10 +434,16 @@ static Mesh *make_mesh(Scene *scene, const SceneFile &file, const xml_node &n, c
 }
 
 /* The lamps' and the sun's shader: plain white light, as strong as the light says. (Cycles' own
- * default_light shader is an emission of strength 0 — a light given it gives no light at all.) */
+ * default_light shader is an emission of strength 0 — a light given it gives no light at all.)
+ * One for each scene built: 1.0.7 (it was made once for the whole program; since 1.0.5 the
+ * brightness is measured in a first scene of its own, and the render's scene then used the
+ * first's shader after it was freed: about one render in three stopped with an access
+ * violation, no picture and no word). */
+static Shader *light_shader_made = nullptr;
+
 static Shader *light_shader(Scene *scene)
 {
-  static Shader *made = nullptr;
+  Shader *&made = light_shader_made;
   if (made == nullptr) {
     unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
     EmissionNode *emission = graph->create_node<EmissionNode>();
@@ -614,6 +635,7 @@ static void make_camera(Scene *scene, const xml_node &c, const int width, const 
 static Built build_scene(Scene *scene, const SceneFile &file)
 {
   Built built;
+  light_shader_made = nullptr; /* (this scene's own, made when the first light needs it) */
   const xml_node root = file.doc.child("akar-render");
   if (!root) {
     fail("the scene description has no <akar-render>");
@@ -703,6 +725,9 @@ class PictureDriver : public OutputDriver {
   std::atomic<bool> measuring{false};
   /* The model's middle brightness in it (-1: none seen). */
   float measured = -1.0f;
+  /* 1.0.7: the colour of the light falling on the model in it (its diffuse light, without the
+   * surfaces' own colours), its brightness 1; (1, 1, 1) when none was seen. */
+  float3 white = one_float3();
   /* The film's exposure in the render, taken off again as the picture is written (the file
    * holds the light as it is: Akar exposes it). */
   float exposure = 1.0f;
@@ -739,6 +764,31 @@ class PictureDriver : public OutputDriver {
     std::nth_element(use.begin(), use.begin() + use.size() / 2, use.end());
     const float middle = use[use.size() / 2];
     measured = middle > 0.0f ? middle : float(sum / double(use.size()));
+
+    /* The light's colour: all the diffuse light reaching the model (direct and bounced), added
+     * up, so the brightest-lit surfaces count most, as they do to the eye. */
+    std::vector<float> direct(size_t(w) * size_t(h) * 3), indirect(size_t(w) * size_t(h) * 3);
+    if (tile.get_pass_pixels("diffuse_direct", 3, direct.data()) && tile.get_pass_pixels("diffuse_indirect", 3, indirect.data())) {
+      double r = 0.0, g = 0.0, b = 0.0;
+      for (size_t i = 0; i < size_t(w) * size_t(h); i++) {
+        if (has_depth && !(depth[i] > 0.0f && depth[i] < 1e8f)) {
+          continue;
+        }
+        const float lr = direct[i * 3] + indirect[i * 3];
+        const float lg = direct[i * 3 + 1] + indirect[i * 3 + 1];
+        const float lb = direct[i * 3 + 2] + indirect[i * 3 + 2];
+        if (!std::isfinite(lr) || !std::isfinite(lg) || !std::isfinite(lb) || lr < 0.0f || lg < 0.0f || lb < 0.0f || lr + lg + lb > 1e6f) {
+          continue;
+        }
+        r += lr;
+        g += lg;
+        b += lb;
+      }
+      const double y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (y > 1e-12) {
+        white = make_float3(float(r / y), float(g / y), float(b / y));
+      }
+    }
   }
 
   bool write(const Tile &tile, const char *name)
@@ -939,6 +989,14 @@ int main(const int argc, const char **argv)
       Pass *depth = scene->create_node<Pass>();
       depth->set_name(ustring("depth"));
       depth->set_type(PASS_DEPTH);
+      if (measuring) {
+        /* 1.0.7: the light alone (Cycles divides out the surfaces' colours), for its colour. */
+        for (const auto &[name, type] : {std::pair{"diffuse_direct", PASS_DIFFUSE_DIRECT}, std::pair{"diffuse_indirect", PASS_DIFFUSE_INDIRECT}}) {
+          Pass *light = scene->create_node<Pass>();
+          light->set_name(ustring(name));
+          light->set_type(type);
+        }
+      }
     }
     Session *raw = made.get();
     made->progress.set_update_callback([&, raw, made_picture]() {
@@ -1005,12 +1063,14 @@ int main(const int argc, const char **argv)
     session->wait();
     const std::string measure_error = session->progress.get_error_message();
     const float measured = picture->measured;
+    const float3 white = picture->white;
     close_session();
     if (!measure_error.empty()) {
       fail(measure_error);
     }
     exposure = measured > 0.0f ? std::clamp(0.18f / measured, 0.001f, 100000.0f) : 1.0f;
     say(string_printf("EXPOSURE %.6g %.6g %.1f", exposure, measured, seconds()));
+    say(string_printf("WHITE %.5f %.5f %.5f", white.x, white.y, white.z));
   }
   if (stop_asked) {
     sp.samples = 1; /* (stopped while measuring: a picture at once) */
