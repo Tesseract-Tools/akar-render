@@ -320,7 +320,8 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
     bumps = nm;
   }
 
-  if (i1(m, "glass", 0)) {
+  const int glass_kind = i1(m, "glass", 0);
+  if (glass_kind != 0) {
     /* 1.0.8: see-through glass (Akar: a plain colour with opacity under 100 %). Before, its
      * opacity mixed the surface with "nothing there", so its reflections were weakened as much as
      * its colour: a wine glass at 20 % kept a fifth of an already faint reflection and showed as
@@ -339,32 +340,57 @@ static ShaderOutput *add_surface(ShaderGraph *graph, const SceneFile &file, cons
      * usually two faces, so each face takes the square root of the pane's tint, and through its
      * two faces it's the pane's own.) */
     const float3 pane = one_float3() + (colour - one_float3()) * (alpha * gloss);
-    clear->set_color(make_float3(sqrtf(fmaxf(pane.x, 0.0f)), sqrtf(fmaxf(pane.y, 0.0f)), sqrtf(fmaxf(pane.z, 0.0f))));
-    GlossyBsdfNode *shine = graph->create_node<GlossyBsdfNode>();
-    shine->set_color(one_float3());
-    shine->set_roughness(rough);
+    const float3 tint = make_float3(sqrtf(fmaxf(pane.x, 0.0f)), sqrtf(fmaxf(pane.y, 0.0f)), sqrtf(fmaxf(pane.z, 0.0f)));
+    clear->set_color(tint);
     const float ior = 1.0f + clamp(f1(m, "specular", 0.5f), 0.0f, 1.0f);
-    FresnelNode *fresnel = graph->create_node<FresnelNode>();
-    /* (Cycles' Fresnel takes a back face for glass to air: past about 42 degrees all of it
-     * reflects. As this glass doesn't bend the light, a ray through a pane seen at a slant then
-     * stayed inside it, bouncing between its two faces until it ran out of bounces: a window
-     * seen from the side came out black. A thin pane is air to glass on both sides, so a back
-     * face is given 1/IOR, which Cycles turns back into the IOR.) */
-    GeometryNode *geometry = graph->create_node<GeometryNode>();
-    MathNode *side = graph->create_node<MathNode>();
-    side->set_math_type(NODE_MATH_MULTIPLY_ADD);
-    side->set_value2(1.0f / ior - ior);
-    side->set_value3(ior);
-    graph->connect(geometry->output("Backfacing"), side->input("Value1"));
-    graph->connect(side->output("Value"), fresnel->input("IOR"));
-    if (bumps != nullptr) {
-      graph->connect(bumps->output("Normal"), shine->input("Normal"));
-      graph->connect(bumps->output("Normal"), fresnel->input("Normal"));
+    ShaderNode *see = nullptr;
+    if (glass_kind == 2) {
+      /* glass="2", a photoreal material (glasses, vases, bottles): it bends the light as real glass
+       * does, which gives it its dark and bright edges (without, the Subishi flat's wine glasses
+       * were faint ghosts). Shadow rays go straight through it, tinted, so light still comes
+       * through. (Windows, a plain colour, stay glass="1": a pane drawn as one face would bend
+       * the view and never bend it back.) */
+      GlassBsdfNode *bent = graph->create_node<GlassBsdfNode>();
+      bent->set_color(tint);
+      bent->set_roughness(rough);
+      bent->set_IOR(ior);
+      if (bumps != nullptr) {
+        graph->connect(bumps->output("Normal"), bent->input("Normal"));
+      }
+      LightPathNode *path = graph->create_node<LightPathNode>();
+      MixClosureNode *mix = graph->create_node<MixClosureNode>();
+      graph->connect(path->output("Is Shadow Ray"), mix->input("Fac"));
+      graph->connect(bent->output("BSDF"), mix->input("Closure1"));
+      graph->connect(clear->output("BSDF"), mix->input("Closure2"));
+      see = mix;
     }
-    MixClosureNode *see = graph->create_node<MixClosureNode>();
-    graph->connect(fresnel->output("Fac"), see->input("Fac"));
-    graph->connect(clear->output("BSDF"), see->input("Closure1"));
-    graph->connect(shine->output("BSDF"), see->input("Closure2"));
+    else {
+      GlossyBsdfNode *shine = graph->create_node<GlossyBsdfNode>();
+      shine->set_color(one_float3());
+      shine->set_roughness(rough);
+      FresnelNode *fresnel = graph->create_node<FresnelNode>();
+      /* (Cycles' Fresnel takes a back face for glass to air: past about 42 degrees all of it
+       * reflects. As this glass doesn't bend the light, a ray through a pane seen at a slant then
+       * stayed inside it, bouncing between its two faces until it ran out of bounces: a window
+       * seen from the side came out black. A thin pane is air to glass on both sides, so a back
+       * face is given 1/IOR, which Cycles turns back into the IOR.) */
+      GeometryNode *geometry = graph->create_node<GeometryNode>();
+      MathNode *side = graph->create_node<MathNode>();
+      side->set_math_type(NODE_MATH_MULTIPLY_ADD);
+      side->set_value2(1.0f / ior - ior);
+      side->set_value3(ior);
+      graph->connect(geometry->output("Backfacing"), side->input("Value1"));
+      graph->connect(side->output("Value"), fresnel->input("IOR"));
+      if (bumps != nullptr) {
+        graph->connect(bumps->output("Normal"), shine->input("Normal"));
+        graph->connect(bumps->output("Normal"), fresnel->input("Normal"));
+      }
+      MixClosureNode *mix = graph->create_node<MixClosureNode>();
+      graph->connect(fresnel->output("Fac"), mix->input("Fac"));
+      graph->connect(clear->output("BSDF"), mix->input("Closure1"));
+      graph->connect(shine->output("BSDF"), mix->input("Closure2"));
+      see = mix;
+    }
     MixClosureNode *glass = graph->create_node<MixClosureNode>();
     glass->set_fac(alpha * rough); /* (the body: none for clear glass, its colour for frosted) */
     graph->connect(see->output("Closure"), glass->input("Closure1"));

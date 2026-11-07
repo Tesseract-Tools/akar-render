@@ -31,9 +31,12 @@ the mesh's `materials`).
 `glass="1"` (from 1.0.8; Akar 0.13.5 writes it for a plain colour that's see-through): the
 see-through part (1 − `alpha`) is clear, tinted by `color` as much as the surface is glossy (the
 tint of a pane: each face takes its square root, a pane being two faces), with
-its own reflection on top (Fresnel, IOR 1 + `specular`: 0.5 is glass's 1.5; sharp or soft by
-`roughness`); a matt one keeps a body of its colour (`alpha` × `roughness`). Transparent, not
-refracting: sunlight comes through a window. Older packs ignore it (the surface mixed with
+its own reflection on top (Fresnel, IOR 1 + `specular`: 0.5 is glass's 1.5, both faces taken as
+air to glass, so a pane seen at a slant isn't black; sharp or soft by `roughness`); a matt one keeps a body of its colour (`alpha` × `roughness`). Transparent, not
+refracting: sunlight comes through a window. `glass="2"` (from 1.0.8; Akar 0.13.5 writes it
+when that material is photoreal: glasses, vases, bottles): the see-through part bends the light
+(Cycles' Glass BSDF, tinted the same way, IOR 1 + `specular`, rough by `roughness`), and shadow
+rays go straight through it, tinted, so light still comes through. Older packs ignore `glass` (the surface mixed with
 nothing by `alpha`). `specular` is the reflectivity (0.5 = a dielectric's own; Akar 0.13.5 writes
 each material's).
 
