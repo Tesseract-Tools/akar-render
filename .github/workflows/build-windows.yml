@@ -19,7 +19,7 @@ on:
         default: false
   push:
     branches: [main]
-    paths: ["host/**", ".github/workflows/build-windows.yml", "VERSION"]
+    paths: ["host/**", ".github/workflows/build-windows.yml", "VERSION", "AKAR"]
 
 permissions:
   contents: write
@@ -48,10 +48,14 @@ jobs:
           $archs = '${{ inputs.cuda_archs }}'
           if (-not $archs) { $archs = 'sm_61;sm_75;sm_86;sm_89;sm_120;compute_75' }
           $version = (Get-Content akar-render/VERSION -Raw).Trim()
+          # The oldest Akar this pack works with (Akar 0.13.4 and later skip a pack that needs a newer Akar).
+          $akar = (Get-Content akar-render/AKAR -Raw).Trim()
+          if ($akar -notmatch '^\d+\.\d+(\.\d+)?$') { throw "AKAR should hold a version such as 0.13.3, not '$akar'" }
+          "akar=$akar" >> $env:GITHUB_OUTPUT
           "gpu=$gpu" >> $env:GITHUB_OUTPUT
           "archs=$archs" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
-          Write-Host "GPU kernels: $gpu; archs: $archs; pack $version"
+          Write-Host "GPU kernels: $gpu; archs: $archs; pack $version for Akar $akar or later"
 
       - name: Cycles source
         shell: pwsh
@@ -137,6 +141,7 @@ jobs:
         shell: pwsh
         run: |
           $v = '${{ steps.cfg.outputs.version }}'
+          $akar = '${{ steps.cfg.outputs.akar }}'
           $pack = "akar-render-pack-$v"
           New-Item -ItemType Directory $pack | Out-Null
           Copy-Item cycles/install/* $pack -Recurse
@@ -148,11 +153,11 @@ jobs:
             ForEach-Object { Copy-Item $_.FullName ("$pack/licenses/" + $_.Directory.Name + "-" + $_.Name) -ErrorAction SilentlyContinue }
           Copy-Item akar-render/LICENSE "$pack/licenses/akar-render-LICENSE.txt"
           Copy-Item akar-render/NOTICE.md "$pack/NOTICE.md"
-          '{ "version": "' + $v + '", "cycles": "${{ env.CYCLES_TAG }}", "gpu": ${{ steps.cfg.outputs.gpu }}, "archs": "${{ steps.cfg.outputs.archs }}", "commit": "${{ github.sha }}" }' | Set-Content "$pack/pack.json"
+          '{ "version": "' + $v + '", "cycles": "${{ env.CYCLES_TAG }}", "gpu": ${{ steps.cfg.outputs.gpu }}, "archs": "${{ steps.cfg.outputs.archs }}", "commit": "${{ github.sha }}", "akar": "' + $akar + '" }' | Set-Content "$pack/pack.json"
           Compress-Archive -Path "$pack/*" -DestinationPath "$pack.zip" -CompressionLevel Optimal
           $h = (Get-FileHash "$pack.zip" -Algorithm SHA256).Hash.ToLower()
           $size = (Get-Item "$pack.zip").Length
-          '{ "version": "' + $v + '", "file": "' + "$pack.zip" + '", "size": ' + $size + ', "sha256": "' + $h + '" }' | Set-Content pack-latest.json
+          '{ "version": "' + $v + '", "file": "' + "$pack.zip" + '", "size": ' + $size + ', "sha256": "' + $h + '", "akar": "' + $akar + '" }' | Set-Content pack-latest.json
           Get-Content pack-latest.json
 
       - name: Keep the pack (artifact)

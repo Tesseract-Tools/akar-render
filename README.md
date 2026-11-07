@@ -15,6 +15,19 @@ it with Cycles for Windows (NVIDIA OptiX and CUDA, and the processor). Akar's ow
 
 The render pack Akar downloads is published under Releases (`pack-<version>`).
 
+## Publishing a new pack
+
+1. Raise `VERSION` (each release needs a new version; `pack-<version>` can't be published twice).
+2. `AKAR` holds the oldest Akar the pack works with. Leave it as it is while the pack reads the scene
+   files older Akars write; raise it when the pack needs something only a newer Akar writes. Akar
+   0.13.4 and later skip a pack that needs a newer Akar and keep the one they have.
+3. Actions → Build render pack (Windows) → Run workflow on `main`, with the NVIDIA kernels and
+   "Publish the pack as a release" on (about 40 minutes).
+
+Akar 0.13.4 and later look for a newer pack once a day and update to it on their own (in the
+background; the old pack is removed once no render is using it). A pack is only downloaded on a PC
+that has used photoreal rendering before.
+
 ## Licences
 
 akar-render is under the Apache License 2.0 (see `LICENSE`). The render pack also contains Cycles
