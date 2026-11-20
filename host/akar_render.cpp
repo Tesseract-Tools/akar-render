@@ -943,25 +943,46 @@ class PictureDriver : public OutputDriver {
 
 /* ---------------------------------------------------------------------------------------- */
 
-static DeviceInfo choose_device(const std::string &wanted)
+/* 1.0.10: the devices to try, best first: a tester's NVIDIA card couldn't load the OptiX
+ * kernel ("Failed to load OptiX kernel ... OPTIX_ERROR_..."; most likely a driver older than
+ * OptiX 8.1 needs) and the render stopped. Now, if a device can't render, the next is tried:
+ * OptiX, then CUDA on the same card, then the processor. */
+static vector<DeviceInfo> device_order(const std::string &wanted)
 {
-  const char *order[] = {"OPTIX", "CUDA", "CPU"};
-  for (const char *name : order) {
+  vector<DeviceInfo> order;
+  for (const char *name : {"OPTIX", "CUDA"}) {
     if (wanted != "AUTO" && wanted != name) {
       continue;
     }
-    const DeviceType type = Device::type_from_string(name);
-    const vector<DeviceInfo> devices = Device::available_devices(DEVICE_MASK(type));
+    const vector<DeviceInfo> devices = Device::available_devices(DEVICE_MASK(Device::type_from_string(name)));
     if (!devices.empty()) {
-      return devices.front();
+      order.push_back(devices.front());
     }
   }
   const vector<DeviceInfo> cpu = Device::available_devices(DEVICE_MASK_CPU);
-  if (cpu.empty()) {
+  if (!cpu.empty()) {
+    order.push_back(cpu.front());
+  }
+  if (order.empty()) {
     fail("no device to render on");
   }
-  return cpu.front();
+  return order;
 }
+
+/* True if an error says the device itself couldn't render (its kernels, its driver), rather
+ * than something about the scene: then the next device is tried. */
+static bool device_error(const std::string &error)
+{
+  std::string e = error;
+  std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+  for (const char *word : {"optix", "cuda", "kernel", "device", "driver", "out of memory", "ptx", "cubin"}) {
+    if (e.find(word) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 
 CCL_NAMESPACE_END
 
@@ -1031,7 +1052,9 @@ int main(const int argc, const char **argv)
   read_scene_file(scene_path, file);
 
   SessionParams sp;
-  sp.device = choose_device(device_name);
+  const vector<DeviceInfo> devices = device_order(device_name);
+  size_t device_at = 0;
+  sp.device = devices[device_at];
   sp.background = true;
   sp.samples = samples;
   sp.threads = threads;
@@ -1144,24 +1167,42 @@ int main(const int argc, const char **argv)
 
   /* How bright the model is: a small picture first (an eighth across, 16 samples, its noise
    * removed), unless the exposure was given. */
+  /* (1.0.10) The next device, after one that couldn't render; false if there's none. */
+  auto next_device = [&](const std::string &error) {
+    if (!device_error(error) || device_at + 1 >= devices.size()) {
+      return false;
+    }
+    say("NOTE " + Device::string_from_type(sp.device.type) + " couldn't render (" + error + "); trying the next device");
+    sp.device = devices[++device_at];
+    say("DEVICE " + Device::string_from_type(sp.device.type) + " " + sp.device.description);
+    return true;
+  };
   float exposure = film_exposure;
   if (exposure <= 0.0f) {
-    open_session(1.0f, true);
-    SessionParams measure_params = sp;
-    measure_params.samples = 16;
-    measure_params.time_limit = 0.0;
-    BufferParams mb;
-    mb.width = std::max(16, built.width / 8);
-    mb.height = std::max(16, built.height / 8);
-    mb.full_width = mb.width;
-    mb.full_height = mb.height;
-    session->reset(measure_params, mb);
-    session->start();
-    session->wait();
-    const std::string measure_error = session->progress.get_error_message();
-    const float measured = picture->measured;
-    const float3 white = picture->white;
-    close_session();
+    std::string measure_error;
+    float measured = 0.0f;
+    float3 white = one_float3();
+    for (;;) {
+      open_session(1.0f, true);
+      SessionParams measure_params = sp;
+      measure_params.samples = 16;
+      measure_params.time_limit = 0.0;
+      BufferParams mb;
+      mb.width = std::max(16, built.width / 8);
+      mb.height = std::max(16, built.height / 8);
+      mb.full_width = mb.width;
+      mb.full_height = mb.height;
+      session->reset(measure_params, mb);
+      session->start();
+      session->wait();
+      measure_error = session->progress.get_error_message();
+      measured = picture->measured;
+      white = picture->white;
+      close_session();
+      if (measure_error.empty() || !next_device(measure_error)) {
+        break;
+      }
+    }
     if (!measure_error.empty()) {
       fail(measure_error);
     }
@@ -1172,20 +1213,25 @@ int main(const int argc, const char **argv)
   if (stop_asked) {
     sp.samples = 1; /* (stopped while measuring: a picture at once) */
   }
-  open_session(exposure, false);
-
-  BufferParams bp;
-  bp.width = built.width;
-  bp.height = built.height;
-  bp.full_width = built.width;
-  bp.full_height = built.height;
-  session->reset(sp, bp);
-  session->start();
-  session->wait();
-
-  const std::string error = session->progress.get_error_message();
-  const bool written = picture->final_written;
-  session.reset();
+  std::string error;
+  bool written = false;
+  for (;;) {
+    open_session(exposure, false);
+    BufferParams bp;
+    bp.width = built.width;
+    bp.height = built.height;
+    bp.full_width = built.width;
+    bp.full_height = built.height;
+    session->reset(sp, bp);
+    session->start();
+    session->wait();
+    error = session->progress.get_error_message();
+    written = picture->final_written;
+    close_session();
+    if (error.empty() || written || stop_asked || !next_device(error)) {
+      break;
+    }
+  }
   if (!error.empty()) {
     fail(error);
   }
