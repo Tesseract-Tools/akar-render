@@ -442,7 +442,6 @@ static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node
     body->set_color(make_float3(powf(hue.x, 1.5f), powf(hue.y, 1.5f), powf(hue.z, 1.5f)));
     body->set_density(3.0f / clearness);
     graph->connect(body->output("Volume"), graph->output()->input("Volume"));
-    shader->set_heterogeneous_volume(false);
   }
   shader->set_graph(std::move(graph));
   shader->tag_update(scene);
