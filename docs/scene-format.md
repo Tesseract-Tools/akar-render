@@ -40,5 +40,13 @@ rays go straight through it, tinted, so light still comes through. Older packs i
 nothing by `alpha`). `specular` is the reflectivity (0.5 = a dielectric's own; Akar 0.13.5 writes
 each material's).
 
+`water="1"` (Akar 0.17 writes it for water, with `water_shallow="r g b"`, `water_deep="r g b"`
+(linear), `water_muddiness` (0 clear to 1 muddy) and `water_depth` (metres it looks deep where
+nothing is under it)). Akar writes clear water as `glass="2"` (smooth, IOR 1.33: `specular`
+0.33, its waves a `normal_map` on texture coordinates in its own tile) and muddy water as an
+opaque surface of its colour. From 1.0.9 clear water also gets a volume that absorbs: most of
+the light gone after 9 m (clear) to 0.12 m (muddy), most of all the colours its shallow colour has
+least of, so a pool's floor deepens in colour with depth. Older packs ignore it.
+
 The pictures akar-render writes (`preview.akri`, `final.akri`): `"AKRI"`, `int32 width, height,
 samples, 0`, then width × height RGBA float32, linear, top row first.

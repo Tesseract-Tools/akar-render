@@ -426,6 +426,24 @@ static Shader *make_material(Scene *scene, const SceneFile &file, const xml_node
     surface = add_surface(graph.get(), file, m, textures, nullptr);
   }
   graph->connect(surface, graph->output()->input("Surface"));
+  if (front < 0 && i1(m, "water", 0) && i1(m, "glass", 0) == 2) {
+    /* 1.0.9: clear water (Akar 0.17's water="1", written as glass that bends the light) colours
+     * what's seen through it by how far the light goes in it, as Akar's view does: a pool's floor
+     * turns from its shallow colour towards its deep one as it gets deeper. A volume that absorbs,
+     * most of all the colours the water's shallow colour has least of (red, for blue-green water):
+     * the light mostly gone after its clearness (9 m for clear water, 0.12 m for muddy). Muddy
+     * water is written as an opaque surface, without this. */
+    const float muddy = clamp(f1(m, "water_muddiness", 0.1f), 0.0f, 1.0f);
+    const float clearness = 9.0f + (0.12f - 9.0f) * powf(muddy, 0.6f);
+    const float3 shallow = f3(m, "water_shallow", make_float3(0.16f, 0.63f, 0.67f));
+    const float top = fmaxf(shallow.x, fmaxf(shallow.y, shallow.z));
+    const float3 hue = top > 1e-4f ? shallow / top : one_float3();
+    AbsorptionVolumeNode *body = graph->create_node<AbsorptionVolumeNode>();
+    body->set_color(make_float3(powf(hue.x, 1.5f), powf(hue.y, 1.5f), powf(hue.z, 1.5f)));
+    body->set_density(3.0f / clearness);
+    graph->connect(body->output("Volume"), graph->output()->input("Volume"));
+    shader->set_heterogeneous_volume(false);
+  }
   shader->set_graph(std::move(graph));
   shader->tag_update(scene);
   return shader;
